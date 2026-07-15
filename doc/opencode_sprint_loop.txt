@@ -96,7 +96,12 @@ exits before active state is observed and closes its timer when observation ends
 All plugin status requests use one serialized child slot. Setup replacement and
 |VimLeavePre| invalidate the replaced configuration. Watcher and successful
 start/resume replacement cancel only setup/watcher reads; public progress and
-session reads remain queued and complete normally. Stop keeps the current
+session reads remain queued and complete normally. Successfully spawned
+start/resume processes have independent identities. Same-root discovery stays
+active until every such launch in the current setup generation exits, so a
+newer duplicate/rejected launch cannot hide an older live launch. Each
+completion updates only its own root/generation ownership even after watcher
+replacement. Stop keeps the current
 watcher across resolver, spawn, command, and success-while-active outcomes until
 status confirms `process_running: false`. Controller children are never
 signalled by observation replacement.
@@ -114,7 +119,10 @@ An interrupted durable active invocation may display `running` while
 Blocked, failed, and stopped projections require a reason.
 Persisted status requires the exact V1 state vocabulary, non-null update and
 last-event evidence, object-shaped local and pushed commit maps with the same
-repository keys, and no active invocation in a terminal state. A
+repository keys, and no active invocation in a terminal state. Terminal
+`stopped`, `failed`, and `finished` projections accept `process_running` true
+while the controller finishes exiting or false afterward; stopped and failed
+still require reasons. A
 truthful interrupted active invocation in a non-terminal state remains valid.
 Recognizable credentials, credential-bearing URLs, URL query/fragment data, and
 common provider-token forms in any rendered field reject the complete status as

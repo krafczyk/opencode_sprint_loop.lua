@@ -151,7 +151,9 @@ not claim that a controller process is alive. Blocked, failed, and stopped
 status documents require a reason. Persisted documents also require the exact V1
 state vocabulary, an update time and last event, compatible repository keys in
 object-shaped local/pushed commit maps, and no active invocation in a
-terminal state. Recognizable credentials, credential-bearing URLs, URL query or
+terminal state. `stopped`, `failed`, and `finished` accept
+`process_running: true` while the controller finishes exiting as well as
+`false`; stopped and failed still require reasons. Recognizable credentials, credential-bearing URLs, URL query or
 fragment data, and common provider-token forms in any displayed field make the
 entire status inconsistent instead of producing a lossy progress view.
 Controller and plugin recognizers use the same explicit ASCII case-folding and
@@ -168,7 +170,12 @@ child-process slot. Repeated setup and Neovim exit invalidate all work from the
 replaced configuration. Watcher replacement and successful start/resume
 replacement cancel only setup/watcher-owned reads and wait for their completion
 callback; queued or active public progress/session reads remain serialized and
-complete normally. Stop preserves the current watcher through resolver, spawn,
+complete normally. Successfully spawned start/resume processes have independent
+launch identities. Same-root discovery survives a newer duplicate or rejected
+launch's no-run completion while an older launch remains alive, and completion
+of either launch updates its own ownership even if the watcher was replaced.
+Different roots and replaced setup generations cannot mutate the current
+watcher. Stop preserves the current watcher through resolver, spawn,
 signal/non-zero, and success-while-still-active outcomes; only status confirming
 `process_running: false` ends observation. Detached and control controller
 processes are never cancellation targets. The watcher stops

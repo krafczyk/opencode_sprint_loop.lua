@@ -233,7 +233,7 @@ function M.decode(output)
     or not bounded_string(status.sprint.multisprint) or not positive_integer(status.sprint.index)
     or not bounded_string(status.state) or not workflow_states[status.state]
     or not validate_active(status.active, status.process_running) or not validate_run_fields(status) then return nil, "inconsistent_status" end
-  if terminal_states[status.state] and (status.process_running or not is_null(status.active.status)) then return nil, "inconsistent_status" end
+  if terminal_states[status.state] and not is_null(status.active.status) then return nil, "inconsistent_status" end
   return status
 end
 

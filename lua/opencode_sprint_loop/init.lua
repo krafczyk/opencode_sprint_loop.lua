@@ -19,7 +19,9 @@ local state = {
   timer = nil,
   in_flight = false,
   observed_active = false,
-  launch_alive = false,
+  watcher_root = nil,
+  launches = {},
+  launch_sequence = 0,
   final_pending = false,
   warned = false,
   requests = {},
@@ -80,7 +82,7 @@ local function invalidate_watcher()
   close_timer()
   state.in_flight = false
   state.observed_active = false
-  state.launch_alive = false
+  state.watcher_root = nil
   state.final_pending = false
   state.warned = false
 end
@@ -219,13 +221,33 @@ end
 
 local observe
 
-local function finish_launch(root, generation, watcher_id)
-  if not watcher_current(generation, watcher_id) then return end
-  state.launch_alive = false
+local function live_launch_count(root, generation)
+  local count = 0
+  for _, launch in pairs(state.launches) do
+    if launch.root == root and launch.generation == generation then count = count + 1 end
+  end
+  return count
+end
+
+local function register_launch(root, generation)
+  state.launch_sequence = state.launch_sequence + 1
+  local launch_id = state.launch_sequence
+  state.launches[launch_id] = { root = root, generation = generation }
+  return launch_id
+end
+
+local function finish_launch(launch_id)
+  local launch = state.launches[launch_id]
+  if not launch then return end
+  state.launches[launch_id] = nil
+  if not watcher_current(launch.generation, state.watcher_id)
+    or state.watcher_root ~= launch.root
+    or live_launch_count(launch.root, launch.generation) > 0 then return end
+  local watcher_id = state.watcher_id
   state.final_pending = true
   if not state.in_flight then
     state.final_pending = false
-    observe(root, generation, watcher_id, true)
+    observe(launch.root, launch.generation, watcher_id, true)
   end
 end
 
@@ -243,14 +265,14 @@ observe = function(root, generation, watcher_id, final_observation)
       state.warned = false
       if document.process_running then state.observed_active = true end
       notify_interaction(document)
-      if state.observed_active and not document.process_running then
+      if state.observed_active and not document.process_running and live_launch_count(root, generation) == 0 then
         stop_watcher(generation, watcher_id)
         return
       end
     end
     if final_observation and (error or not document.process_running) then
       stop_watcher(generation, watcher_id)
-    elseif state.final_pending and not state.launch_alive then
+    elseif state.final_pending and live_launch_count(root, generation) == 0 then
       state.final_pending = false
       observe(root, generation, watcher_id, true)
     end
@@ -261,6 +283,7 @@ local function start_watcher(root, generation, already_observed)
   invalidate_watcher()
   state.watching = true
   state.observed_active = already_observed == true
+  state.watcher_root = root
   state.warned = false
   local watcher_id = state.watcher_id
   observe(root, generation, watcher_id, false)
@@ -298,7 +321,7 @@ local function controller_action(name)
           if executable_error then notify(executable_error); return end
           local argv = { executable, name, "--root", root }
           if action_needs_server(name) then table.insert(argv, "--server-url"); table.insert(argv, server_url) end
-          local launch_watcher_id = nil
+          local launch_id = nil
           process.run(argv, {
             detach = name == "run",
             env = environment,
@@ -307,14 +330,14 @@ local function controller_action(name)
               if not current(generation) then return end
               if name == "run" or name == "resume" then
                 cancel_observation_work()
-                launch_watcher_id = start_watcher(root, generation)
-                state.launch_alive = true
+                launch_id = register_launch(root, generation)
+                start_watcher(root, generation)
                 notify(name == "run" and "controller launch requested; confirm activity with progress" or "controller resume requested; confirm activity with progress", vim.log.levels.INFO)
               end
             end,
           }, function(result, spawn_error)
+            if launch_id then finish_launch(launch_id) end
             if not current(generation) then return end
-            if launch_watcher_id then finish_launch(root, generation, launch_watcher_id) end
             local error = command_error(result, spawn_error)
             if error then notify(error); return end
             if name == "run" or name == "resume" then
@@ -358,6 +381,7 @@ function M.setup(options)
   cancel_openers()
   cancel_resolvers()
   cancel_status_requests()
+  state.launches = {}
   state.generation = state.generation + 1
   invalidate_watcher()
   state.options = validated
@@ -478,7 +502,9 @@ function M._test_reset()
     timer = nil,
     in_flight = false,
     observed_active = false,
-    launch_alive = false,
+    watcher_root = nil,
+    launches = {},
+    launch_sequence = state.launch_sequence,
     final_pending = false,
     warned = false,
     requests = {},
@@ -500,6 +526,7 @@ vim.api.nvim_create_autocmd("VimLeavePre", { callback = function()
   cancel_openers()
   cancel_resolvers()
   cancel_status_requests()
+  state.launches = {}
   invalidate_watcher()
 end })
 return M

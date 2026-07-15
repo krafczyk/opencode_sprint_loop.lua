@@ -740,9 +740,6 @@ local workflow_state_cases = {
   { "paused", false, nil, false },
   { "blocked", false, nil, true },
   { "stopping", true, nil, false },
-  { "stopped", false, nil, true },
-  { "failed", false, nil, true },
-  { "finished", false, nil, false },
 }
 for _, case in ipairs(workflow_state_cases) do
   local fixture = persisted(case[1], case[2], case[3])
@@ -752,6 +749,27 @@ for _, case in ipairs(workflow_state_cases) do
   check(rendered_state:find("State: " .. case[1], 1, true) ~= nil, case[1] .. " state renders")
   check((fixture.reason ~= null) == case[4], case[1] .. " fixture has the state-specific reason presence")
   check((case[3] == nil) == (fixture.active.status == null), case[1] .. " fixture has the state-specific active invocation")
+end
+for _, state_name in ipairs({ "stopped", "failed", "finished" }) do
+  for _, process_running in ipairs({ true, false }) do
+    local fixture = persisted(state_name, process_running)
+    local decoded_state, err = status.decode(json(fixture))
+    local rendered_state = decoded_state and table.concat(status.render(decoded_state), "\n") or ""
+    local label = state_name .. " with process_running " .. tostring(process_running)
+    check(decoded_state ~= nil and err == nil, label .. " decodes")
+    check(rendered_state:find("State: " .. state_name, 1, true) ~= nil
+      and rendered_state:find("Process running: " .. tostring(process_running), 1, true) ~= nil, label .. " renders")
+    check(fixture.active.status == null, label .. " retains a null active invocation")
+    check((fixture.reason ~= null) == (state_name == "stopped" or state_name == "failed"), label .. " retains valid reason semantics")
+    local active_terminal = vim.deepcopy(fixture)
+    active_terminal.active = persisted("validating", false, "running").active
+    check(status.decode(json(active_terminal)) == nil, label .. " rejects an active invocation")
+    if state_name == "stopped" or state_name == "failed" then
+      local missing_terminal_reason = vim.deepcopy(fixture)
+      missing_terminal_reason.reason = null
+      check(status.decode(json(missing_terminal_reason)) == nil, label .. " rejects a missing reason")
+    end
+  end
 end
 local decoded, decode_error = status.decode('{"a":1,"\\u0061":2}')
 check(decoded == nil and decode_error == "invalid_status_json", "escaped-equivalent duplicate keys reject")
@@ -821,7 +839,6 @@ local malformed_shapes = {
   { "empty commit maps", function(value) value.commits["local"] = {}; value.commits.pushed = {} end },
   { "different repository keys", function(value) value.commits.pushed = { other = null } end },
   { "incomplete repository key set", function(value) value.commits["local"].other = null end },
-  { "running terminal process", function(value) value.state = "finished"; value.process_running = true end },
   { "active terminal invocation", function(value) value.state = "failed"; value.reason = { code = "failed_reason", message = "safe detail" }; value.active = persisted("validating", false, "running").active end },
 }
 for _, case in ipairs(malformed_shapes) do
@@ -829,6 +846,36 @@ for _, case in ipairs(malformed_shapes) do
   case[2](malformed)
   decoded, decode_error = status.decode(json(malformed))
   check(decoded == nil and decode_error == "inconsistent_status", case[1] .. " rejects")
+end
+
+-- Every terminal process projection also reaches the public progress path.
+do
+  local public_document = no_run()
+  local public_reads = 0
+  clear_notifications(); loop._test_reset()
+  if ui.window and vim.api.nvim_win_is_valid(ui.window) then vim.api.nvim_win_close(ui.window, true) end
+  ui.buffer, ui.window = nil, nil
+  process.set_runner_for_test(function(argv, _, callback)
+    if argv[2] == "status" then public_reads = public_reads + 1 end
+    local output = json(vim.deepcopy(public_document))
+    vim.schedule(function() callback({ code = 0, signal = 0, stdout = output, stderr = "" }) end)
+    return {}
+  end)
+  loop.setup({ executable = "fake", sprint_root = "/tmp/terminal-progress", server_url = "http://127.0.0.1" })
+  wait_for(function() return public_reads == 1 and loop._test_state().status_active == nil end, "terminal public-progress setup completes")
+  for _, state_name in ipairs({ "stopped", "failed", "finished" }) do
+    for _, process_running in ipairs({ true, false }) do
+      public_document = persisted(state_name, process_running)
+      local before = public_reads
+      loop.progress()
+      wait_for(function()
+        if public_reads <= before or loop._test_state().status_active ~= nil or ui.buffer == nil or not vim.api.nvim_buf_is_valid(ui.buffer) then return false end
+        local lines = table.concat(vim.api.nvim_buf_get_lines(ui.buffer, 0, -1, false), "\n")
+        return lines:find("State: " .. state_name, 1, true) ~= nil
+          and lines:find("Process running: " .. tostring(process_running), 1, true) ~= nil
+      end, state_name .. " process " .. tostring(process_running) .. " reaches public progress")
+    end
+  end
 end
 
 do
@@ -1119,6 +1166,119 @@ loop.setup(setup_options)
 wait_for(function() return status_calls >= 1 end, "no-run setup query completes")
 status_calls = 0; loop.start()
 wait_for(function() return not loop._test_state().watching and status_calls >= 2 end, "launch exit triggers final observation and watcher shutdown")
+
+-- Overlapping same-root launches retain discovery until both identities finish.
+local function overlapping_launch_case(completion_order)
+  local launch_callbacks, overlap_status_calls = {}, 0
+  local overlap_provider = no_run("/tmp/overlapping-launches")
+  clear_notifications(); loop._test_reset(); loop._test_set_watch_interval(5)
+  process.set_runner_for_test(function(argv, _, callback)
+    if argv[2] == "status" then
+      overlap_status_calls = overlap_status_calls + 1
+      local output = json(vim.deepcopy(overlap_provider))
+      vim.defer_fn(function() callback({ code = 0, signal = 0, stdout = output, stderr = "" }) end, 1)
+    else
+      table.insert(launch_callbacks, callback)
+    end
+    return {}
+  end)
+  loop.setup({ executable = "fake", sprint_root = "/tmp/overlapping-launches", server_url = "http://127.0.0.1" })
+  wait_for(function() return overlap_status_calls == 1 and loop._test_state().status_active == nil end, completion_order .. " overlap setup completes")
+  loop.start(); loop.start()
+  wait_for(function()
+    return #launch_callbacks == 2 and table_count(loop._test_state().launches) == 2
+      and loop._test_state().watching and loop._test_state().watcher_root == "/tmp/overlapping-launches"
+  end, completion_order .. " tracks two same-root launch identities")
+
+  if completion_order == "newer-first" then
+    launch_callbacks[2]({ code = 4, signal = 0, stdout = "", stderr = "" })
+    wait_for(function() return table_count(loop._test_state().launches) == 1 end, "rejected newer launch releases only its identity")
+    local reads_after_rejection = overlap_status_calls
+    wait_for(function() return overlap_status_calls > reads_after_rejection end, "older live launch retains no-run discovery")
+    check(loop._test_state().watching, "newer rejected no-run launch cannot stop older same-root discovery")
+    overlap_provider = persisted("implementing", true, "waiting_for_user")
+    overlap_provider.sprint_root = "/tmp/overlapping-launches"
+    wait_for(function() return notification_count("needs user input") == 1 end, "older launch later exposes waiting_for_user notification")
+    launch_callbacks[1]({ code = 0, signal = 0, stdout = "", stderr = "" })
+    wait_for(function() return table_count(loop._test_state().launches) == 0 end, "older completion releases ownership after watcher replacement")
+    overlap_provider = persisted("finished", false)
+    overlap_provider.sprint_root = "/tmp/overlapping-launches"
+    wait_for(function() return not loop._test_state().watching end, "same-root watcher stops after active status ends and all launches finish")
+  else
+    launch_callbacks[1]({ code = 0, signal = 0, stdout = "", stderr = "" })
+    wait_for(function() return table_count(loop._test_state().launches) == 1 end, "older-first completion releases only the older identity")
+    local reads_after_older = overlap_status_calls
+    wait_for(function() return overlap_status_calls > reads_after_older end, "newer live launch retains discovery after older completion")
+    check(loop._test_state().watching, "older-first completion cannot end same-root discovery")
+    launch_callbacks[2]({ code = 4, signal = 0, stdout = "", stderr = "" })
+    wait_for(function() return table_count(loop._test_state().launches) == 0 and not loop._test_state().watching end, "newer rejected completion performs final no-run shutdown")
+  end
+end
+overlapping_launch_case("newer-first")
+overlapping_launch_case("older-first")
+
+-- Root and setup-generation ownership prevent stale launch completion mutation.
+do
+  local roots = { "/tmp/root-setup", "/tmp/root-a", "/tmp/root-b" }
+  local root_index, root_callbacks = 0, {}
+  clear_notifications(); loop._test_reset(); loop._test_set_watch_interval(5)
+  process.set_runner_for_test(function(argv, _, callback)
+    if argv[2] == "status" then
+      local output = json(no_run(argv[4]))
+      vim.defer_fn(function() callback({ code = 0, signal = 0, stdout = output, stderr = "" }) end, 1)
+    else
+      root_callbacks[argv[4]] = callback
+    end
+    return {}
+  end)
+  loop.setup({
+    executable = "fake",
+    sprint_root = function() root_index = root_index + 1; return roots[root_index] end,
+    server_url = "http://127.0.0.1",
+  })
+  wait_for(function() return loop._test_state().status_active == nil end, "distinct-root setup completes")
+  loop.start(); loop.start()
+  wait_for(function()
+    return root_callbacks["/tmp/root-a"] ~= nil and root_callbacks["/tmp/root-b"] ~= nil
+      and table_count(loop._test_state().launches) == 2 and loop._test_state().watcher_root == "/tmp/root-b"
+  end, "distinct roots retain separate identities and latest watcher ownership")
+  root_callbacks["/tmp/root-b"]({ code = 4, signal = 0, stdout = "", stderr = "" })
+  wait_for(function() return not loop._test_state().watching and table_count(loop._test_state().launches) == 1 end, "current root finalizes independently of another root's live launch")
+  root_callbacks["/tmp/root-a"]({ code = 0, signal = 0, stdout = "", stderr = "" })
+  wait_for(function() return table_count(loop._test_state().launches) == 0 end, "non-current root completion releases only stale ownership")
+  check(not loop._test_state().watching and loop._test_state().watcher_root == nil, "non-current root completion cannot recreate a watcher")
+end
+
+do
+  local generation_callbacks = {}
+  clear_notifications(); loop._test_reset(); loop._test_set_watch_interval(5)
+  process.set_runner_for_test(function(argv, _, callback)
+    if argv[2] == "status" then
+      local output = json(no_run(argv[4]))
+      vim.defer_fn(function() callback({ code = 0, signal = 0, stdout = output, stderr = "" }) end, 1)
+    else
+      generation_callbacks[argv[4]] = callback
+    end
+    return {}
+  end)
+  loop.setup({ executable = "fake", sprint_root = "/tmp/generation-old", server_url = "http://127.0.0.1" })
+  wait_for(function() return loop._test_state().status_active == nil end, "old generation setup completes")
+  loop.start()
+  wait_for(function() return generation_callbacks["/tmp/generation-old"] ~= nil and table_count(loop._test_state().launches) == 1 end, "old generation launch is tracked")
+  loop.setup({ executable = "fake", sprint_root = "/tmp/generation-new", server_url = "http://127.0.0.1" })
+  wait_for(function() return loop._test_state().status_active == nil and table_count(loop._test_state().launches) == 0 end, "setup replacement clears prior-generation ownership")
+  loop.start()
+  wait_for(function()
+    return generation_callbacks["/tmp/generation-new"] ~= nil and table_count(loop._test_state().launches) == 1
+      and loop._test_state().watcher_root == "/tmp/generation-new"
+  end, "replacement generation owns its launch and watcher")
+  generation_callbacks["/tmp/generation-old"]({ code = 0, signal = 0, stdout = "", stderr = "" })
+  vim.wait(30)
+  check(table_count(loop._test_state().launches) == 1 and loop._test_state().watching
+    and loop._test_state().watcher_root == "/tmp/generation-new", "old-generation completion cannot mutate replacement ownership")
+  generation_callbacks["/tmp/generation-new"]({ code = 4, signal = 0, stdout = "", stderr = "" })
+  wait_for(function() return table_count(loop._test_state().launches) == 0 and not loop._test_state().watching end, "replacement generation finalizes normally")
+end
 
 -- One in-flight status process and one warning per continuous failure episode.
 local concurrent, max_concurrent, sequence = 0, 0, 0
