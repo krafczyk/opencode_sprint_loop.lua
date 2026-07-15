@@ -88,6 +88,8 @@ local production_resolver_timeout = config.RESOLVER_TIMEOUT_MS
 config.RESOLVER_TIMEOUT_MS = 20
 clear_notifications(); loop.setup({ sprint_root = "/tmp/root" })
 check(notification_count("invalid_setup") == 1 and #calls == 0, "missing required setup field fails without process")
+clear_notifications(); loop.setup({ server_url = "http://127.0.0.1" })
+check(notification_count("invalid_setup") == 1 and #calls == 0, "independently missing sprint_root fails without process")
 for _, unknown_key in ipairs({
   "api_key=synthetic-setup-credential",
   "https://user:synthetic-setup-credential@example.invalid/path",
@@ -120,51 +122,58 @@ wait_for(function() return #calls == 2 end, "default executable drives public ac
 check(calls[1].argv[1] == "sprint-loop" and calls[2].argv[1] == "sprint-loop", "public path defaults executable to exact sprint-loop")
 loop._test_reset()
 
-local function resolve_result(value, timeout)
+local function resolve_result(value, timeout, callback_style)
   local result, resolve_error, count
   count = 0
-  config.resolve(value, 1, function() return true end, function(resolved, err) result, resolve_error, count = resolved, err, count + 1 end)
+  config.resolve(value, 1, function() return true end, function(resolved, err) result, resolve_error, count = resolved, err, count + 1 end, callback_style)
   vim.wait(timeout or 200, function() return count > 0 end, 5)
   return result, resolve_error, count
 end
 local resolved, resolve_error, resolve_count = resolve_result(function() return "value" end)
 check(resolved == "value" and resolve_error == nil and resolve_count == 1, "synchronous resolver completes once")
-resolved, resolve_error, resolve_count = resolve_result(function(done) done("callback") end)
+resolved, resolve_error, resolve_count = resolve_result(function(done) done("callback") end, nil, true)
 check(resolved == "callback" and resolve_error == nil and resolve_count == 1, "callback resolver completes once")
-resolved, resolve_error, resolve_count = resolve_result(function(done) done("first"); done("second") end)
+resolved, resolve_error, resolve_count = resolve_result(function(done) done("first"); done("second") end, nil, true)
 check(resolved == nil and resolve_error == "resolver_failed" and resolve_count == 1, "duplicate callback rejects before consumer")
-resolved, resolve_error, resolve_count = resolve_result(function(done) done("callback"); return "return" end)
+resolved, resolve_error, resolve_count = resolve_result(function(done) done("callback"); return "return" end, nil, true)
 check(resolved == nil and resolve_error == "resolver_failed" and resolve_count == 1, "callback plus return rejects before consumer")
 resolved, resolve_error, resolve_count = resolve_result(function(done)
   vim.defer_fn(function() done("delayed callback") end, 5)
   return "synchronous return"
-end)
+end, nil, true)
 check(resolved == nil and resolve_error == "resolver_failed" and resolve_count == 1, "delayed callback after return rejects before consumer")
 resolved, resolve_error, resolve_count = resolve_result(function(done)
   done("first callback")
   vim.defer_fn(function() done("delayed duplicate") end, 5)
-end)
+end, nil, true)
 check(resolved == nil and resolve_error == "resolver_failed" and resolve_count == 1, "delayed duplicate callback rejects before consumer")
 resolved, resolve_error = resolve_result(function() error("synthetic") end)
 check(resolved == nil and resolve_error == "resolver_failed", "throwing resolver has concise error")
 resolved, resolve_error = resolve_result(function() return "bad\0value" end)
 check(resolved == nil and resolve_error == "invalid_resolved_value", "control-bearing resolver value rejects")
-resolved, resolve_error = resolve_result(function(_) end, 200)
+resolved, resolve_error = resolve_result(function(_) end, 200, true)
 check(resolved == nil and resolve_error == "resolver_failed", "resolver timeout is bounded")
+resolved, resolve_error = resolve_result(function(done) done("callback misuse") end)
+check(resolved == nil and resolve_error == "resolver_failed", "non-URL callback-style resolver is rejected")
+for _, invalid_result in ipairs({ false, 17, {}, "" }) do
+  resolved, resolve_error = resolve_result(function() return invalid_result end)
+  check(resolved == nil and resolve_error == "invalid_resolved_value", "non-URL malformed synchronous result rejects")
+end
+resolved, resolve_error = resolve_result(function() return nil end)
+check(resolved == nil and resolve_error == "invalid_resolved_value", "non-URL nil synchronous result rejects")
 local stale_called = false
-config.resolve(function(done) vim.defer_fn(function() done("late") end, 20) end, 1, function() return false end, function() stale_called = true end)
+config.resolve(function(done) vim.defer_fn(function() done("late") end, 20) end, 1, function() return false end, function() stale_called = true end, true)
 vim.wait(50)
 check(not stale_called, "stale resolver completion is ignored")
 local cancelled_called = false
-local cancellable = config.resolve(function(_) end, 1, function() return true end, function() cancelled_called = true end)
+local cancellable = config.resolve(function(_) end, 1, function() return true end, function() cancelled_called = true end, true)
 check(cancellable.is_active(), "function resolver exposes an active cancellable lifetime")
 cancellable.cancel()
 check(not cancellable.is_active(), "function resolver cancellation closes its timer")
 vim.wait(30)
 check(not cancelled_called, "cancelled function resolver cannot invoke its consumer")
 
--- Resolver timers are owned by setup and closed when setup is replaced.
-local old_setup_done
+-- A scheduled synchronous setup resolution is invalidated when setup is replaced.
 calls = {}; loop._test_reset()
 process.set_runner_for_test(function(argv, _, callback)
   table.insert(calls, vim.deepcopy(argv))
@@ -173,15 +182,13 @@ process.set_runner_for_test(function(argv, _, callback)
 end)
 loop.setup({
   executable = "fake",
-  sprint_root = function(done) old_setup_done = done end,
+  sprint_root = function() return "/tmp/stale" end,
   server_url = "http://127.0.0.1",
 })
-wait_for(function() return table_count(loop._test_state().resolvers) == 1 end, "setup owns its pending resolver timer")
 loop.setup({ executable = "fake", sprint_root = "/tmp/replacement", server_url = "http://127.0.0.1" })
-wait_for(function() return #calls == 1 and table_count(loop._test_state().resolvers) == 0 end, "repeated setup cancels old resolver timers")
-old_setup_done("/tmp/stale")
+wait_for(function() return #calls == 1 and table_count(loop._test_state().resolvers) == 0 end, "repeated setup invalidates old scheduled resolution")
 vim.wait(30)
-check(#calls == 1, "cancelled setup resolver cannot spawn stale status")
+check(#calls == 1 and calls[1][4] == "/tmp/replacement", "cancelled setup resolution cannot spawn stale status")
 
 -- URL validation rejects malformed or credential-bearing values without disclosure.
 check(url.valid_server_origin("http://127.0.0.1:4096") and url.valid_server_origin("https://[::1]:443/"), "valid server origins pass")
@@ -334,7 +341,11 @@ local function public_option_matrix(label, options, expected)
   end
   check(vim.deep_equal(status_call.argv, { expected.executable, "status", "--root", expected.root, "--json" }), label .. " executable/root reach public status")
   check(vim.deep_equal(run_call.argv, { expected.executable, "run", "--root", expected.root, "--server-url", expected.server }), label .. " server reaches public start")
-  check(run_call.options.env.SSL_CERT_FILE == expected.ca and not vim.tbl_contains(run_call.argv, expected.ca), label .. " CA reaches only child environment")
+  if expected.ca then
+    check(run_call.options.env.SSL_CERT_FILE == expected.ca and not vim.tbl_contains(run_call.argv, expected.ca), label .. " CA reaches only child environment")
+  else
+    check(run_call.options.env == nil, label .. " leaves the child environment override exactly absent")
+  end
   check(opened:find(expected.web, 1, true) == 1 and opened:find("/session/ses%2Fone%20two", 1, true) ~= nil, label .. " web URL reaches public session route")
 end
 
@@ -351,6 +362,16 @@ public_option_matrix("string option forms", {
   web = "https://string-web.example.test/prefix", ca = string_ca,
 })
 vim.fn.delete(string_ca)
+
+public_option_matrix("synchronous URL function forms", {
+  executable = function() return "sync-url-executable" end,
+  sprint_root = function() return "/tmp/sync-url-root" end,
+  server_url = function() return "https://sync-server.example.test" end,
+  web_url = function() return "https://sync-web.example.test/prefix" end,
+}, {
+  executable = "sync-url-executable", root = "/tmp/sync-url-root", server = "https://sync-server.example.test",
+  web = "https://sync-web.example.test/prefix", ca = nil,
+})
 
 local function_ca = vim.fn.tempname()
 vim.fn.writefile({ "synthetic function CA" }, function_ca)
@@ -376,6 +397,119 @@ public_option_matrix("function option forms", {
 })
 check(callback_counts.server >= 1 and callback_counts.web == 1 and callback_counts.ca >= 1, "callback URL and function CA resolvers are consumed by public actions")
 vim.fn.delete(function_ca)
+loop._test_reset()
+
+-- Non-URL callback misuse and malformed public resolver results cannot launch actions.
+for _, option in ipairs({ "executable", "sprint_root" }) do
+  local misuse_calls = 0
+  clear_notifications(); loop._test_reset()
+  process.set_runner_for_test(function(_, _, callback)
+    misuse_calls = misuse_calls + 1
+    vim.schedule(function() callback({ code = 0, signal = 0, stdout = json(no_run()), stderr = "" }) end)
+    return {}
+  end)
+  local options = { executable = "fake", sprint_root = "/tmp/root", server_url = "http://127.0.0.1" }
+  options[option] = function(done) done("callback misuse") end
+  loop.setup(options)
+  wait_for(function() return notification_count("resolver_failed") == 1 end, option .. " callback misuse reports resolver failure")
+  check(misuse_calls == 0, option .. " callback misuse has no process side effect")
+end
+for _, malformed in ipairs({
+  { "sprint_root nil", "sprint_root", function() return nil end },
+  { "executable empty", "executable", function() return "" end },
+  { "executable non-string", "executable", function() return 17 end },
+}) do
+  local malformed_calls = 0
+  clear_notifications(); loop._test_reset()
+  process.set_runner_for_test(function(_, _, callback)
+    malformed_calls = malformed_calls + 1
+    vim.schedule(function() callback({ code = 0, signal = 0, stdout = json(no_run()), stderr = "" }) end)
+    return {}
+  end)
+  local options = { executable = "fake", sprint_root = "/tmp/root", server_url = "http://127.0.0.1" }
+  options[malformed[2]] = malformed[3]
+  loop.setup(options)
+  wait_for(function() return notification_count("invalid_resolved_value") == 1 end, malformed[1] .. " reports publicly")
+  check(malformed_calls == 0, malformed[1] .. " has no process side effect")
+end
+
+local ca_misuse_calls = {}
+clear_notifications(); loop._test_reset()
+process.set_runner_for_test(function(argv, _, callback)
+  table.insert(ca_misuse_calls, vim.deepcopy(argv))
+  vim.schedule(function() callback({ code = 0, signal = 0, stdout = argv[2] == "status" and json(no_run()) or "", stderr = "" }) end)
+  return {}
+end)
+loop.setup({
+  executable = "fake", sprint_root = "/tmp/root", server_url = "https://example.test",
+  server_ca_cert = function(done) done("callback misuse") end,
+})
+wait_for(function() return #ca_misuse_calls == 1 end, "CA misuse setup observation completes")
+loop.start()
+wait_for(function() return notification_count("resolver_failed") == 1 end, "CA callback misuse reports resolver failure")
+check(#ca_misuse_calls == 1, "CA callback misuse cannot launch a controller child or install an environment")
+
+clear_notifications(); loop._test_reset(); ca_misuse_calls = {}
+loop.setup({
+  executable = "fake", sprint_root = "/tmp/root", server_url = "https://example.test",
+  server_ca_cert = function() return false end,
+})
+wait_for(function() return #ca_misuse_calls == 1 end, "non-string CA setup observation completes")
+loop.start()
+wait_for(function() return notification_count("invalid_resolved_value") == 1 end, "non-string CA result rejects publicly")
+check(#ca_misuse_calls == 1, "non-string CA result cannot launch or install an environment")
+
+for _, invalid_result in ipairs({ false, 17, {}, "" }) do
+  local invalid_calls = {}
+  clear_notifications(); loop._test_reset()
+  process.set_runner_for_test(function(argv, _, callback)
+    table.insert(invalid_calls, vim.deepcopy(argv))
+    vim.schedule(function() callback({ code = 0, signal = 0, stdout = json(no_run()), stderr = "" }) end)
+    return {}
+  end)
+  loop.setup({ executable = "fake", sprint_root = "/tmp/root", server_url = function() return invalid_result end })
+  wait_for(function() return #invalid_calls == 1 end, "malformed server result setup status completes")
+  loop.start()
+  wait_for(function() return notification_count("invalid_resolved_value") == 1 end, "malformed server result rejects publicly")
+  check(#invalid_calls == 1, "malformed server result cannot launch")
+end
+do
+  local nil_server_calls = {}
+  clear_notifications(); loop._test_reset()
+  process.set_runner_for_test(function(argv, _, callback)
+    table.insert(nil_server_calls, vim.deepcopy(argv))
+    vim.schedule(function() callback({ code = 0, signal = 0, stdout = json(no_run()), stderr = "" }) end)
+    return {}
+  end)
+  loop.setup({ executable = "fake", sprint_root = "/tmp/root", server_url = function() return nil end })
+  wait_for(function() return #nil_server_calls == 1 end, "nil server result setup status completes")
+  loop.start()
+  wait_for(function() return notification_count("resolver_failed") == 1 end, "nil server result rejects publicly")
+  check(#nil_server_calls == 1, "nil server result cannot launch")
+end
+for _, web_case in ipairs({
+  { "nil", function() return nil end, "resolver_failed" },
+  { "empty", function() return "" end, "invalid_resolved_value" },
+  { "boolean", function() return false end, "invalid_resolved_value" },
+  { "number", function() return 17 end, "invalid_resolved_value" },
+  { "table", function() return {} end, "invalid_resolved_value" },
+}) do
+  local nil_calls = {}
+  clear_notifications(); loop._test_reset()
+  process.set_runner_for_test(function(argv, _, callback)
+    table.insert(nil_calls, vim.deepcopy(argv))
+    vim.schedule(function() callback({ code = 0, signal = 0, stdout = json(persisted("validating", false, "running")), stderr = "" }) end)
+    return {}
+  end)
+  loop.setup({
+    executable = "fake", sprint_root = "/tmp/root", server_url = "http://127.0.0.1",
+    web_url = web_case[2],
+  })
+  wait_for(function() return #nil_calls == 1 end, web_case[1] .. " web result setup status completes")
+  loop.open_session()
+  wait_for(function() return notification_count(web_case[3]) == 1 end, web_case[1] .. " web result rejects publicly")
+  check(#nil_calls == 2, web_case[1] .. " web result performs only the required status read")
+end
 loop._test_reset()
 
 -- Status grammar, compatibility states, malformed categories, and complete rendering.
@@ -486,28 +620,59 @@ for index, case in ipairs(rendered_credentials) do
   check(decoded == nil and decode_error == "inconsistent_status", case[1] .. " rejects credential-bearing display text")
 end
 local provider_families = {
-  { "GitHub server", "ghs_" .. string.rep("A.", 18), "ghs_" .. string.rep("A", 35) },
-  { "GitHub OAuth/PAT", "ghp_" .. string.rep("A", 36), "ghp_" .. string.rep("A", 35) },
-  { "GitHub fine-grained", "github_pat_" .. string.rep("A_", 10), "github_pat_" .. string.rep("-", 20) },
-  { "GitLab", "glpat-" .. string.rep("A_", 10), "glpat-" .. string.rep(".", 20) },
-  { "OpenAI generic", "sk-" .. string.rep("A_", 10), "sk-" .. string.rep(".", 20) },
-  { "Anthropic", "sk-ant-api01-" .. string.rep("A", 20), "sk-ant-api01-" .. string.rep(".", 20) },
-  { "OpenRouter", "sk-or-v1-" .. string.rep("A", 20), "sk-or-v1-" .. string.rep(".", 20) },
-  { "Google", "AIza" .. string.rep("A_", 15), "AIza" .. string.rep(".", 30) },
-  { "Hugging Face", "hf_" .. string.rep("A", 20), "hf_" .. string.rep("_", 20) },
-  { "Slack OAuth", "xoxb-" .. string.rep("A-", 10), "xoxb-" .. string.rep("_", 20) },
-  { "Slack app", "xapp-" .. string.rep("A-", 10), "xapp-" .. string.rep("_", 20) },
-  { "AWS", "AKIA" .. string.rep("A", 16), "AKIA" .. string.rep("_", 16) },
+  { "ghs_", string.rep("A.", 18), string.rep("A", 35) },
+  { "gho_", string.rep("A", 36), string.rep("A", 35) },
+  { "ghp_", string.rep("A", 36), string.rep("A", 35) },
+  { "ghu_", string.rep("A", 36), string.rep("A", 35) },
+  { "ghr_", string.rep("A", 36), string.rep("A", 35) },
+  { "github_pat_", string.rep("A_", 10), string.rep("A", 19) },
+}
+for _, prefix in ipairs({
+  "glpat-", "glcbt-", "glptt-", "glrt-", "glimt-", "glsoat-", "gldt-",
+  "glrtr-", "glft-", "glagent-", "glwt-", "glffct-", "gloas-",
+}) do table.insert(provider_families, { prefix, string.rep("A_", 10), string.rep("A", 19) }) end
+for _, prefix in ipairs({ "sk-proj-", "sk-svcacct-", "sk-admin-", "sk-ant-api01-", "sk-ant-oat99-", "sk-or-v1-" }) do
+  table.insert(provider_families, { prefix, string.rep("A", 20), "." .. string.rep("A", 20) })
+end
+table.insert(provider_families, { "sk-", string.rep("A_", 10), string.rep("A", 19) })
+table.insert(provider_families, { "AIza", string.rep("A_", 15), string.rep("A", 29) })
+table.insert(provider_families, { "hf_", string.rep("A", 20), "_" .. string.rep("A", 20) })
+for _, prefix in ipairs({ "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xapp-", "xwfp-" }) do
+  table.insert(provider_families, { prefix, string.rep("A-", 10), "_" .. string.rep("A", 20) })
+end
+table.insert(provider_families, { "AKIA", string.rep("A", 16), "_" .. string.rep("A", 16) })
+table.insert(provider_families, { "ASIA", string.rep("A", 16), "_" .. string.rep("A", 16) })
+
+local credential_parity_positives = {
+  "Authorization: Basic c3ludGhldGljOnBhc3N3b3Jk",
+  "proxy-authorization\t:\tBeArEr synthetic-token_123",
+  "password = synthetic-password",
+  "https://user:synthetic@example.invalid/path",
+  "https://example.invalid/path?opaque=synthetic",
+  "-----BEGIN SYNTHETIC PRIVATE KEY-----",
+}
+local credential_parity_near_misses = {
+  "Authorization:\194\160Bearer synthetic-token",
+  "Authorization: ſasic c3ludGhldGlj",
+  "paſsword=synthetic-password",
+  "toKen=synthetic-token",
+  "AKIA" .. string.rep("A", 16),
 }
 for _, family in ipairs(provider_families) do
+  table.insert(credential_parity_positives, family[1] .. family[2])
+  table.insert(credential_parity_near_misses, family[1] .. family[3])
+end
+for _, credential in ipairs(credential_parity_positives) do
   local credential_document = persisted("validating", false, "running")
-  credential_document.updated_at = family[2]
+  credential_document.updated_at = credential
   decoded, decode_error = status.decode(json(credential_document))
-  check(decoded == nil and decode_error == "inconsistent_status", family[1] .. " recognized token rejects")
+  check(decoded == nil and decode_error == "inconsistent_status", "ASCII parity credential rejects")
+end
+for _, near_miss in ipairs(credential_parity_near_misses) do
   local near_miss_document = persisted("validating", false, "running")
-  near_miss_document.updated_at = family[3]
+  near_miss_document.updated_at = near_miss
   decoded, decode_error = status.decode(json(near_miss_document))
-  check(decoded ~= nil and decode_error == nil, family[1] .. " unsupported near miss remains accepted")
+  check(decoded ~= nil and decode_error == nil, "ASCII parity unsupported near miss remains accepted")
 end
 local rendered = table.concat(status.render(persisted("validating", true, "running")), "\n")
 for _, evidence in ipairs({ "remaining effort -", "commit -", "3 not evaluated", "assessed -", "Last event: #9" }) do check(rendered:find(evidence, 1, true) ~= nil, "progress renders " .. evidence) end
@@ -638,7 +803,9 @@ loop._test_reset()
 local lifecycle_active, lifecycle_max = 0, 0
 local lifecycle_status_spawns, lifecycle_status_kills, lifecycle_controller_kills = 0, 0, 0
 local lifecycle_controller_spawns = 0
+local lifecycle_browser_opens = 0
 clear_notifications(); loop._test_reset(); loop._test_set_watch_interval(1000)
+loop._test_set_browser(function() lifecycle_browser_opens = lifecycle_browser_opens + 1; return {} end)
 process.set_runner_for_test(function(argv, _, callback)
   if argv[2] ~= "status" then
     lifecycle_controller_spawns = lifecycle_controller_spawns + 1
@@ -676,10 +843,10 @@ process.set_runner_for_test(function(argv, _, callback)
   end }
 end)
 
-local lifecycle_options = { executable = "fake", sprint_root = "/tmp/lifecycle-one", server_url = "http://127.0.0.1" }
+local lifecycle_options = { executable = "fake", sprint_root = "/tmp/lifecycle-one", server_url = "http://127.0.0.1", web_url = "https://example.test" }
 loop.setup(lifecycle_options)
 wait_for(function() return lifecycle_active == 1 end, "delayed setup status child is retained")
-lifecycle_options = { executable = "fake", sprint_root = "/tmp/lifecycle-two", server_url = "http://127.0.0.1" }
+lifecycle_options = { executable = "fake", sprint_root = "/tmp/lifecycle-two", server_url = "http://127.0.0.1", web_url = "https://example.test" }
 loop.setup(lifecycle_options)
 wait_for(function()
   local active = loop._test_state().status_active
@@ -697,34 +864,37 @@ vim.wait(20)
 check(lifecycle_active == 1 and lifecycle_status_spawns == spawns_before_public_queries, "progress and session status queries queue behind the global status child")
 
 local kills_before = lifecycle_status_kills
-loop._test_replace_watcher("/tmp/lifecycle-two")
-wait_for(function()
-  local active = loop._test_state().status_active
-  return lifecycle_status_kills > kills_before and active and active.owner.kind == "watcher"
-end, "watcher replacement cancels then serializes its status child")
-
-kills_before = lifecycle_status_kills
 loop.start()
 wait_for(function() return lifecycle_controller_spawns >= 1 and lifecycle_status_kills > kills_before end, "start replaces watcher status observation")
+wait_for(function() return lifecycle_browser_opens == 1 and ui.buffer ~= nil and vim.api.nvim_buf_is_valid(ui.buffer) end, "start preserves queued public progress and session completions")
 wait_for(function()
   local active = loop._test_state().status_active
   return active and active.owner.kind == "watcher"
 end, "start watcher status waits for cancelled child callback")
 
+loop.progress()
+loop.open_session()
 kills_before = lifecycle_status_kills
 loop.resume()
 wait_for(function() return lifecycle_controller_spawns >= 2 and lifecycle_status_kills > kills_before end, "resume replaces watcher status observation")
+wait_for(function() return lifecycle_browser_opens == 2 end, "resume preserves queued public session completion")
 wait_for(function()
   local active = loop._test_state().status_active
   return active and active.owner.kind == "watcher"
 end, "resume watcher status remains globally serialized")
 
+loop.progress()
+loop.open_session()
 kills_before = lifecycle_status_kills
 loop.stop()
-wait_for(function() return lifecycle_controller_spawns >= 3 and lifecycle_status_kills > kills_before and loop._test_state().status_active == nil end, "stop cancels plugin-owned status observation")
+wait_for(function() return lifecycle_controller_spawns >= 3 and lifecycle_browser_opens == 3 end, "stop preserves queued public status actions")
+check(lifecycle_status_kills == kills_before and loop._test_state().watching, "stop preserves the current watcher until status confirms inactivity")
 
 loop._test_replace_watcher("/tmp/lifecycle-two")
-wait_for(function() return loop._test_state().status_active ~= nil end, "exit test owns one status child")
+wait_for(function()
+  local active = loop._test_state().status_active
+  return active ~= nil and active.owner.kind == "watcher" and not active.cancelled
+end, "exit test owns one uncancelled status child")
 kills_before = lifecycle_status_kills
 local spawns_before_exit = lifecycle_status_spawns
 vim.api.nvim_exec_autocmds("VimLeavePre", {})
@@ -733,6 +903,62 @@ vim.wait(100)
 check(lifecycle_status_spawns == spawns_before_exit, "VimLeavePre cannot spawn a replacement status child")
 check(lifecycle_max == 1, "all setup, watcher, and public status children are globally non-overlapping")
 check(lifecycle_controller_kills == 0, "status cancellation never signals detached or control controller children")
+loop._test_reset()
+
+-- Stop failures and a successful delegation cannot invalidate observation of an active controller.
+local function stop_observation_case(label, outcome)
+  local case_status_calls, root_resolutions = 0, 0
+  clear_notifications(); loop._test_reset(); loop._test_set_watch_interval(10)
+  process.set_runner_for_test(function(argv, _, callback)
+    if argv[2] == "status" then
+      case_status_calls = case_status_calls + 1
+      vim.defer_fn(function()
+        callback({ code = 0, signal = 0, stdout = json(persisted("validating", true, "running")), stderr = "" })
+      end, 1)
+      return {}
+    end
+    if outcome == "spawn" then return nil end
+    vim.schedule(function()
+      callback({
+        code = outcome == "nonzero" and 4 or 0,
+        signal = outcome == "signal" and 15 or 0,
+        stdout = "",
+        stderr = "",
+      })
+    end)
+    return {}
+  end)
+  loop.setup({
+    executable = "fake",
+    sprint_root = function()
+      root_resolutions = root_resolutions + 1
+      if outcome == "resolver" and root_resolutions > 1 then return nil end
+      return "/tmp/stop-observation"
+    end,
+    server_url = "http://127.0.0.1",
+  })
+  wait_for(function() return loop._test_state().watching and case_status_calls >= 2 end, label .. " establishes observation")
+  local before = case_status_calls
+  loop.stop()
+  if outcome == "success" then
+    wait_for(function() return notification_count("stop delegated") == 1 end, label .. " delegates successfully")
+  elseif outcome == "resolver" then
+    wait_for(function() return notification_count("invalid_resolved_value") == 1 end, label .. " reports resolver failure")
+  elseif outcome == "spawn" then
+    wait_for(function() return notification_count("process_spawn_failed") == 1 end, label .. " reports spawn failure")
+  else
+    wait_for(function() return notification_count("controller_command_failed") == 1 end, label .. " reports command failure")
+  end
+  wait_for(function() return case_status_calls > before end, label .. " continues status observation")
+  check(loop._test_state().watching, label .. " remains observed while status says process_running true")
+end
+for _, case in ipairs({
+  { "stop resolver failure", "resolver" },
+  { "stop spawn failure", "spawn" },
+  { "stop signal outcome", "signal" },
+  { "stop non-zero outcome", "nonzero" },
+  { "stop success-but-still-active outcome", "success" },
+}) do stop_observation_case(case[1], case[2]) end
 loop._test_reset()
 
 -- A delayed callback from a replaced setup generation cannot notify current state.
@@ -750,8 +976,8 @@ vim.wait(100)
 check(notification_count("needs user input") == 0 and not loop._test_state().watching, "stale setup callback cannot notify or replace watcher")
 loop._test_reset()
 
--- Replacing a watcher cancels its executable resolver before stale resolution can spawn.
-local resolver_invocations, stale_watcher_done = 0, nil
+-- Replacing a watcher invalidates a scheduled synchronous executable result before it can spawn.
+local resolver_invocations = 0
 local watcher_status_spawns, watcher_argv = 0, {}
 clear_notifications(); loop._test_reset(); loop._test_set_watch_interval(100)
 process.set_runner_for_test(function(argv, _, callback)
@@ -761,17 +987,17 @@ process.set_runner_for_test(function(argv, _, callback)
   return {}
 end)
 loop.setup({
-  executable = function(done)
+  executable = function()
     resolver_invocations = resolver_invocations + 1
-    if resolver_invocations == 2 then stale_watcher_done = done; return end
+    if resolver_invocations == 2 then
+      vim.schedule(function() loop._test_replace_watcher("/tmp/root") end)
+      return "stale-executable"
+    end
     return "fake"
   end,
   sprint_root = "/tmp/root",
   server_url = "http://127.0.0.1",
 })
-wait_for(function() return stale_watcher_done ~= nil end, "watcher owns its pending executable resolver")
-loop._test_replace_watcher("/tmp/root")
-stale_watcher_done("stale-executable")
 wait_for(function() return watcher_status_spawns >= 2 end, "replacement watcher resolves and spawns its own status query")
 vim.wait(40)
 local stale_spawned = false
@@ -808,6 +1034,8 @@ local prior_fake_mode = vim.env.SPRINT_LOOP_FAKE_MODE
 
 vim.env.SPRINT_LOOP_FAKE_MODE = nil
 clear_notifications(); loop._test_reset()
+if ui.window and vim.api.nvim_win_is_valid(ui.window) then vim.api.nvim_win_close(ui.window, true) end
+ui.buffer, ui.window = nil, nil
 loop.setup({ executable = fake, sprint_root = "/tmp/synthetic-sprint", server_url = "http://127.0.0.1:4096" })
 loop.progress()
 wait_for(function() return ui.buffer ~= nil and vim.api.nvim_buf_is_valid(ui.buffer) end, "production adapter renders successful fake status")

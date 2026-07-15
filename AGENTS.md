@@ -44,7 +44,7 @@ These commands delegate to the documented `sprint-loop` CLI contract.
 
 - Execute controller commands asynchronously so Neovim remains responsive.
 - Construct argument arrays directly. Do not build shell command strings from paths, URLs, or user input.
-- Resolve configured callbacks at command execution time because workspace and server URLs may change.
+- Resolve configured options at command execution time because workspace and server URLs may change. Sprint-root, executable, and CA functions return synchronously; only server/web URL functions may use `done(value, error)` callbacks.
 - Launch the controller with detached process semantics so closing Neovim does not terminate it.
 - Treat `sprint-loop status --json` as the status source of truth.
 - Validate required JSON fields, tolerate unknown fields, and report malformed output clearly.
@@ -55,7 +55,7 @@ These commands delegate to the documented `sprint-loop` CLI contract.
 
 ## Configuration
 
-Accept values or callbacks for the controller executable, sprint root, OpenCode server URL, and optional OpenCode web URL. Keep mkchad integration in configuration or an adapter rather than coupling the core plugin to mkchad internals.
+Accept strings or synchronous-return functions for the controller executable and sprint root. Accept strings or synchronous/callback functions for the OpenCode server URL and optional web URL. Keep mkchad integration in configuration or an adapter rather than coupling the core plugin to mkchad internals.
 
 ## Development Practices
 

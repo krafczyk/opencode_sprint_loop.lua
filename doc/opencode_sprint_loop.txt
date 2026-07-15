@@ -13,22 +13,24 @@ SETUP                                                            *SprintLoop-set
 >lua
   require("opencode_sprint_loop").setup({
     sprint_root = function() return vim.fn.getcwd() end,
-    server_url = function(done) return "http://127.0.0.1:4096" end,
+    server_url = function() return "http://127.0.0.1:4096" end,
     executable = "sprint-loop",
     web_url = "http://127.0.0.1:4096",
   })
 <
 
-`sprint_root` and `server_url` are required. All fields accept a string or a
-resolver. Resolvers run at action time. They may return a string or call
-`done(value, error)` exactly once. Function results remain private for a
-five-second arbitration window so delayed return-plus-callback or duplicate
-completion is rejected before an action launches. `executable` defaults to
-`sprint-loop`. `web_url` is used only by
+`sprint_root` and `server_url` are required. All fields accept a string.
+Function-valued `sprint_root`, `executable`, and `server_ca_cert` return one
+string synchronously and receive no completion callback. Only `server_url` and
+`web_url` functions may return synchronously or call `done(value, error)` once.
+URL function results remain private for a five-second arbitration window so
+delayed return-plus-callback or duplicate completion rejects before launch.
+`executable` defaults to `sprint-loop`. `web_url` is used only by
 |SprintLoopOpenSession|. `server_ca_cert`, when supplied, resolves to an absolute readable regular file
 passed only as SSL_CERT_FILE to `run` and `resume`; browser CA trust is separate.
-Resolver timers are owned by their setup, watcher, or action lifecycle. Repeated
-setup, watcher replacement, and Neovim exit cancel the relevant timers.
+Setup resolves root and executable for its mandatory initial status observation;
+later actions re-resolve every option they need. Resolver lifetimes are owned by
+their setup, watcher, or action lifecycle.
 Commands are registered at plugin load. Before successful setup they report
 `setup_required`; repeated setup replaces configuration and watcher state while
 preserving pending-request notification deduplication for this Neovim process.
@@ -68,11 +70,13 @@ question content or submit an answer. Sprint 2's probe is non-interactive;
 waiting is a controlled-fixture compatibility demonstration until Sprint 4.
 The watcher performs a final status observation when a launched controller
 exits before active state is observed and closes its timer when observation ends.
-All plugin status requests use one serialized child slot. Setup/watcher
-replacement, start/resume observation replacement, stop, and |VimLeavePre|
-cancel only plugin-owned read-only status children and wait for their callback
-before another status child starts. Detached controller children are not
-retained by this cancellation path and are never signalled by it.
+All plugin status requests use one serialized child slot. Setup replacement and
+|VimLeavePre| invalidate the replaced configuration. Watcher and successful
+start/resume replacement cancel only setup/watcher reads; public progress and
+session reads remain queued and complete normally. Stop keeps the current
+watcher across resolver, spawn, command, and success-while-active outcomes until
+status confirms `process_running: false`. Controller children are never
+signalled by observation replacement.
 
 PROGRESS                                                        *SprintLoop-progress*
 
@@ -89,6 +93,9 @@ truthful interrupted active invocation in a non-terminal state remains valid.
 Recognizable credentials, credential-bearing URLs, URL query/fragment data, and
 common provider-token forms in any rendered field reject the complete status as
 `inconsistent_status`; the plugin does not render a lossy sanitized projection.
+The plugin and controller use the same ASCII case-folding and ASCII-whitespace
+credential grammar. Conventional ASCII secrets reject; Unicode long-s,
+Kelvin-sign, and NBSP syntax lookalikes are unsupported near misses.
 
 SECURITY                                                        *SprintLoop-security*
 

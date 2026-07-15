@@ -11,23 +11,27 @@ Put this repository on Neovim's runtime path, then configure it explicitly:
 ```lua
 require("opencode_sprint_loop").setup({
   sprint_root = function() return vim.fn.getcwd() end,
-  server_url = function(done) return "http://127.0.0.1:4096" end,
+  server_url = function() return "http://127.0.0.1:4096" end,
   executable = "sprint-loop", -- optional; this is the default
   web_url = "http://127.0.0.1:4096", -- optional, for session opening only
 })
 ```
 
 `setup()` is required before every action. Each option accepts a non-empty
-string or a resolver. Resolvers are evaluated when needed, not at setup time;
-they may synchronously return a string or call `done(value, error)` once. A
-function resolver has a five-second arbitration window. The plugin does not
-consume even a synchronous return until that window closes, because the same
-function could invoke `done` later; return-plus-callback and duplicate callback
-completion are rejected before an action launches. The required `sprint_root` and
-`server_url` are not discovered or guessed.
-Resolver timers belong to the setup, watcher, or action that created them. They
-are cancelled when setup or a watcher is replaced and on Neovim exit, so a stale
-watcher resolution cannot launch another status process.
+string. Function-valued `sprint_root`, `executable`, and `server_ca_cert` must
+return that string synchronously; they are invoked without a completion
+callback, and callback-style misuse is rejected before a controller child or CA
+environment override is created. Only `server_url` and `web_url` functions may
+either return synchronously or call `done(value, error)` once. A URL function has
+a five-second arbitration window: even a synchronous URL return remains private
+until that window closes so return-plus-callback and duplicate callbacks reject
+before an action launches. The required values are not discovered or guessed.
+
+Setup resolves `sprint_root` and `executable` for its mandatory initial status
+observation. Every public action re-resolves the options it needs, including root
+and executable, so setup-time observation does not freeze later action values.
+Resolver lifetimes belong to the setup, watcher, or action that created them and
+are invalidated on replacement or Neovim exit.
 
 All six commands are registered when the plugin loads, so invoking one before
 successful setup reports `setup_required` instead of an unknown command. A
@@ -113,16 +117,24 @@ object-shaped local/pushed commit maps, and no active invocation in a
 terminal state. Recognizable credentials, credential-bearing URLs, URL query or
 fragment data, and common provider-token forms in any displayed field make the
 entire status inconsistent instead of producing a lossy progress view.
+Controller and plugin recognizers use the same explicit ASCII case-folding and
+ASCII-whitespace grammar. Conventional ASCII authorization, URI, named-value,
+private-key, and provider-token credentials reject; Unicode lookalikes such as
+long-s or Kelvin-sign letters and NBSP separators are unsupported near misses.
 
 Setup first performs one asynchronous status observation, notifies for a valid
 pending request in that first document, and only then starts the single
 ephemeral watcher when the document reports a running controller.
 Successful start/resume launches also begin discovery. The watcher polls at a
 bounded two-second interval. All plugin status queries share one serialized
-child-process slot. Repeated setup, watcher replacement, start/resume
-observation replacement, stop, and Neovim exit cancel plugin-owned read-only
-status children and wait for their completion callback before another status
-child starts; detached controller processes are never cancellation targets. It stops
+child-process slot. Repeated setup and Neovim exit invalidate all work from the
+replaced configuration. Watcher replacement and successful start/resume
+replacement cancel only setup/watcher-owned reads and wait for their completion
+callback; queued or active public progress/session reads remain serialized and
+complete normally. Stop preserves the current watcher through resolver, spawn,
+signal/non-zero, and success-while-still-active outcomes; only status confirming
+`process_running: false` ends observation. Detached and control controller
+processes are never cancellation targets. The watcher stops
 after an observed controller exits (including a final launch-completion observation)
 and emits one notification per pending request ID
 for future-compatible `waiting_for_user` status. It never reads question text,

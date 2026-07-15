@@ -46,12 +46,12 @@ local function cancel_resolvers(kind, identifier)
   end
 end
 
-local function resolve_value(value, generation, owner, predicate, callback)
+local function resolve_value(value, generation, owner, predicate, callback, callback_style)
   local handle
   handle = config.resolve(value, generation, predicate, function(result, error)
     if handle then state.resolvers[handle] = nil end
     callback(result, error)
-  end)
+  end, callback_style)
   if handle.is_active() then state.resolvers[handle] = owner end
 end
 
@@ -151,7 +151,8 @@ cancel_status_requests = function(kind, identifier)
 end
 
 local function resolve_option(key, generation, owner, predicate, callback)
-  resolve_value(state.options[key], generation, owner, predicate or current, callback)
+  local callback_style = key == "server_url" or key == "web_url"
+  resolve_value(state.options[key], generation, owner, predicate or current, callback, callback_style)
 end
 
 local function ca_environment(generation, owner, predicate, callback)
@@ -185,10 +186,10 @@ end
 
 local function cancel_observation_work()
   cancel_resolvers("setup")
-  cancel_resolvers("status_action")
-  -- Mark every queued read-only child before signalling the active one so even
-  -- a synchronous cancellation callback cannot drain stale observation work.
-  cancel_status_requests()
+  cancel_status_requests("setup")
+  -- Watcher/setup reads are replaceable observation work. User-requested
+  -- progress and open-session reads stay serialized in the public queue and
+  -- receive their normal actionable completion.
   invalidate_watcher()
 end
 
@@ -268,7 +269,6 @@ end
 
 local function controller_action(name)
   if not state.options then notify("setup_required: call setup() first"); return end
-  if name == "stop" then cancel_observation_work() end
   local generation = state.generation
   state.action_id = state.action_id + 1
   local owner = { kind = "action", id = state.action_id }

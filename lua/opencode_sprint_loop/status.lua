@@ -24,6 +24,12 @@ local function find_plain(value, needle, start)
   return value:find(needle, start or 1, true)
 end
 
+local function ascii_lower(value)
+  return (value:gsub("[A-Z]", function(character)
+    return string.char(character:byte() + 32)
+  end))
+end
+
 local function provider_token(value, lower, prefix, minimum, suffix_class)
   local start = 1
   while true do
@@ -36,12 +42,16 @@ local function provider_token(value, lower, prefix, minimum, suffix_class)
 end
 
 local function contains_credential(value)
-  local lower = value:lower()
+  -- Credential syntax uses ASCII case folding and ASCII whitespace. Do not let
+  -- Lua locale behavior drift from the controller's explicit Python grammar.
+  local lower = ascii_lower(value)
+  local whitespace = "[ \t\n\r\f\v]"
+  local ascii_value = "[!-~]"
   for _, name in ipairs({ "authorization", "proxy-authorization" }) do
     for _, scheme in ipairs({ "basic", "bearer" }) do
       local start = 1
       while true do
-        local first, last = lower:find(name .. "%s*:%s*" .. scheme .. "%s+%S+", start)
+        local first, last = lower:find(name .. whitespace .. "*:" .. whitespace .. "*" .. scheme .. whitespace .. "+" .. ascii_value .. "+", start)
         if not first then break end
         -- Python's \b rejects a preceding ASCII word character.
         if not previous_is(lower, first, "[A-Za-z0-9_]") then return true end
@@ -58,8 +68,16 @@ local function contains_credential(value)
     if not first then break end
     if not previous_is(lower, first, "[A-Za-z0-9+%.%-]") then
       local remainder = value:sub(after)
-      if remainder:match("^[^/%s@]*@") then return true end
-      local token = remainder:match("^([^%s]+)") or ""
+      local at = remainder:find("@", 1, true)
+      if at then
+        local valid_userinfo = true
+        for index = 1, at - 1 do
+          local byte = remainder:byte(index)
+          if byte < 33 or byte > 126 or byte == 47 or byte == 64 then valid_userinfo = false; break end
+        end
+        if valid_userinfo then return true end
+      end
+      local token = remainder:match("^([!-~]+)") or ""
       local marker = token:find("[?#]")
       if marker and marker > 1 then
         local kind = token:sub(marker, marker)
@@ -75,12 +93,21 @@ local function contains_credential(value)
     "credential", "password", "secret", "token",
   }
   for _, name in ipairs(names) do
-    if lower:find("[?&#]" .. name .. "=[^&#%s]+") then return true end
+    for _, marker in ipairs({ "?", "&", "#" }) do
+      local query_start = 1
+      while true do
+        local _, last = find_plain(lower, marker .. name .. "=", query_start)
+        if not last then break end
+        local byte = lower:byte(last + 1)
+        if byte and byte >= 33 and byte <= 126 and byte ~= 35 and byte ~= 38 then return true end
+        query_start = last + 1
+      end
+    end
     local start = 1
     while true do
       local first, last = find_plain(lower, name, start)
       if not first then break end
-      if not previous_is(lower, first, "[A-Za-z0-9_%-]") and lower:sub(last + 1):match("^%s*[=:]%s*%S+") then return true end
+      if not previous_is(lower, first, "[A-Za-z0-9_%-]") and lower:sub(last + 1):match("^" .. whitespace .. "*[=:]" .. whitespace .. "*" .. ascii_value .. "+") then return true end
       start = last + 1
     end
   end

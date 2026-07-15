@@ -47,13 +47,14 @@ local function valid_resolved(value)
   return type(value) == "string" and value ~= "" and not value:find("[%z\1-\31\127]")
 end
 
----Resolve a configured string or callback-style resolver exactly once.
+---Resolve a configured string or resolver exactly once.
 ---@param value string|function
 ---@param generation number
 ---@param current fun(): boolean
 ---@param callback fun(string|nil, string|nil)
+---@param callback_style? boolean whether this is a URL resolver accepting done(value, error)
 ---@return table handle cancellable resolver-lifetime handle
-function M.resolve(value, generation, current, callback)
+function M.resolve(value, generation, current, callback, callback_style)
   local completed, cancelled = false, false
   local timer = nil
   local handle = {}
@@ -75,6 +76,20 @@ function M.resolve(value, generation, current, callback)
         completed = true
         if valid_resolved(value) then callback(value, nil) else callback(nil, "invalid_resolved_value") end
       end
+    end)
+    return handle
+  end
+  if not callback_style then
+    -- Non-URL options have a deliberately synchronous function contract. No
+    -- completion callback is supplied, so callback-style misuse fails before
+    -- any consumer can spawn a process or install an environment override.
+    local ok, returned = xpcall(value, debug.traceback)
+    vim.schedule(function()
+      if cancelled or completed or not current(generation) then return end
+      completed = true
+      if not ok then callback(nil, "resolver_failed")
+      elseif not valid_resolved(returned) then callback(nil, "invalid_resolved_value")
+      else callback(returned, nil) end
     end)
     return handle
   end
