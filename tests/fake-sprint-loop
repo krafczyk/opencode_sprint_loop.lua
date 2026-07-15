@@ -48,6 +48,8 @@ case "${1:-}" in
     fi
     if [ -n "${SPRINT_LOOP_TEST_MARKER:-}" ]; then
       sleep 1
+      printf '%s\n' 'detached stdout after editor exit'
+      printf '%s\n' 'detached stderr after editor exit' >&2
       printf '%s\n' survived > "$SPRINT_LOOP_TEST_MARKER"
     fi
     ;;
@@ -61,6 +63,12 @@ case "${1:-}" in
       exit 8
     fi
     printf '%s\n' 'synthetic CA environment observed'
+    ;;
+  browser-open)
+    exit 0
+    ;;
+  browser-fail)
+    exit 7
     ;;
   pause|resume|stop)
     printf '%s\n' feature_not_implemented

@@ -1,5 +1,6 @@
 --- Configuration validation and deferred resolver support.
 local M = {}
+local before_delivery_for_test = nil
 
 M.RESOLVER_TIMEOUT_MS = 5000
 local allowed = {
@@ -55,7 +56,7 @@ end
 ---@param callback_style? boolean whether this is a URL resolver accepting done(value, error)
 ---@return table handle cancellable resolver-lifetime handle
 function M.resolve(value, generation, current, callback, callback_style)
-  local completed, cancelled = false, false
+  local decided, delivered, cancelled = false, false, false
   local timer = nil
   local handle = {}
   local function close_timer()
@@ -63,17 +64,17 @@ function M.resolve(value, generation, current, callback, callback_style)
     timer = nil
   end
   function handle.cancel()
-    if completed or cancelled then return end
+    if delivered or cancelled then return end
     cancelled = true
     close_timer()
   end
   function handle.is_active()
-    return not completed and not cancelled
+    return not delivered and not cancelled
   end
   if type(value) == "string" then
     vim.schedule(function()
-      if not cancelled and current(generation) then
-        completed = true
+      if not cancelled and not delivered and current(generation) then
+        delivered = true
         if valid_resolved(value) then callback(value, nil) else callback(nil, "invalid_resolved_value") end
       end
     end)
@@ -85,8 +86,8 @@ function M.resolve(value, generation, current, callback, callback_style)
     -- any consumer can spawn a process or install an environment override.
     local ok, returned = xpcall(value, debug.traceback)
     vim.schedule(function()
-      if cancelled or completed or not current(generation) then return end
-      completed = true
+      if cancelled or delivered or not current(generation) then return end
+      delivered = true
       if not ok then callback(nil, "resolver_failed")
       elseif not valid_resolved(returned) then callback(nil, "invalid_resolved_value")
       else callback(returned, nil) end
@@ -99,18 +100,20 @@ function M.resolve(value, generation, current, callback, callback_style)
   local return_value
   timer = vim.uv.new_timer()
   local function finish(result, error)
-    if completed or cancelled then return end
-    completed = true
+    if decided or cancelled then return end
+    decided = true
     close_timer()
+    if before_delivery_for_test then before_delivery_for_test() end
     vim.schedule(function()
-      if cancelled or not current(generation) then return end
+      if cancelled or delivered or not current(generation) then return end
+      delivered = true
       if error ~= nil then callback(nil, "resolver_failed")
       elseif not valid_resolved(result) then callback(nil, "invalid_resolved_value")
       else callback(result, nil) end
     end)
   end
   local function arbitrate()
-    if completed or not resolver_returned then return end
+    if decided or cancelled or not resolver_returned then return end
     if callback_count > 1 or (callback_count > 0 and return_value ~= nil) then
       finish(nil, "duplicate completion")
     elseif return_value ~= nil then
@@ -127,7 +130,7 @@ function M.resolve(value, generation, current, callback, callback_style)
   timer:start(M.RESOLVER_TIMEOUT_MS, 0, vim.schedule_wrap(arbitrate))
   local ok, returned = xpcall(function()
     return value(function(result, error)
-      if completed then return end
+      if decided or cancelled then return end
       callback_count = callback_count + 1
       if callback_count == 1 then callback_result, callback_error = result, error end
       if resolver_returned and (callback_count > 1 or return_value ~= nil) then
@@ -145,12 +148,44 @@ function M.resolve(value, generation, current, callback, callback_style)
   return handle
 end
 
-function M.valid_ca_path(path)
-  if type(path) ~= "string" or path:sub(1, 1) ~= "/" or path:find("[%z\1-\31\127]") then
-    return false
+function M._test_set_before_delivery(callback)
+  before_delivery_for_test = callback
+end
+
+---Validate a CA path through asynchronous libuv open/fstat/close operations.
+---@return table handle cancellable validation-lifetime handle
+function M.validate_ca_path(path, generation, current, callback)
+  local cancelled, delivered = false, false
+  local handle = {}
+  function handle.cancel()
+    if cancelled or delivered then return end
+    cancelled = true
   end
-  local details = vim.uv.fs_stat(path)
-  return details ~= nil and details.type == "file" and vim.fn.filereadable(path) == 1
+  function handle.is_active() return not cancelled and not delivered end
+  local function deliver(valid)
+    vim.schedule(function()
+      if cancelled or delivered or not current(generation) then return end
+      delivered = true
+      callback(valid)
+    end)
+  end
+  if type(path) ~= "string" or path:sub(1, 1) ~= "/" or path:find("[%z\1-\31\127]") then
+    deliver(false)
+    return handle
+  end
+  vim.uv.fs_open(path, "r", 0, function(open_error, file_descriptor)
+    if open_error or not file_descriptor then
+      deliver(false)
+      return
+    end
+    vim.uv.fs_fstat(file_descriptor, function(stat_error, details)
+      local valid = stat_error == nil and details ~= nil and details.type == "file"
+      vim.uv.fs_close(file_descriptor, function()
+        deliver(valid)
+      end)
+    end)
+  end)
+  return handle
 end
 
 return M

@@ -1,5 +1,6 @@
 --- Strict controller status decoding and presentation-safe validation.
 local M = { MAX_STATUS_BYTES = 256 * 1024, MAX_DISPLAY_BYTES = 2048 }
+local security = require("opencode_sprint_loop.security")
 
 local required = {
   "schema_version", "controller_version", "sprint_root", "run_exists", "process_running", "run_id",
@@ -15,132 +16,9 @@ local workflow_states = {
 }
 local terminal_states = { stopped = true, failed = true, finished = true }
 
-local function previous_is(value, position, character_class)
-  if position <= 1 then return false end
-  return value:sub(position - 1, position - 1):match(character_class) ~= nil
-end
-
-local function find_plain(value, needle, start)
-  return value:find(needle, start or 1, true)
-end
-
-local function ascii_lower(value)
-  return (value:gsub("[A-Z]", function(character)
-    return string.char(character:byte() + 32)
-  end))
-end
-
-local function provider_token(value, lower, prefix, minimum, suffix_class)
-  local start = 1
-  while true do
-    local first, last = find_plain(lower, prefix, start)
-    if not first then return false end
-    local suffix = value:sub(last + 1):match("^(" .. suffix_class .. "+)") or ""
-    if #suffix >= minimum then return true end
-    start = last + 1
-  end
-end
-
-local function contains_credential(value)
-  -- Credential syntax uses ASCII case folding and ASCII whitespace. Do not let
-  -- Lua locale behavior drift from the controller's explicit Python grammar.
-  local lower = ascii_lower(value)
-  local whitespace = "[ \t\n\r\f\v]"
-  local ascii_value = "[!-~]"
-  for _, name in ipairs({ "authorization", "proxy-authorization" }) do
-    for _, scheme in ipairs({ "basic", "bearer" }) do
-      local start = 1
-      while true do
-        local first, last = lower:find(name .. whitespace .. "*:" .. whitespace .. "*" .. scheme .. whitespace .. "+" .. ascii_value .. "+", start)
-        if not first then break end
-        -- Python's \b rejects a preceding ASCII word character.
-        if not previous_is(lower, first, "[A-Za-z0-9_]") then return true end
-        start = last + 1
-      end
-    end
-  end
-
-  -- Match the controller's URI recognizers: a scheme starts at the first valid
-  -- scheme character, then user-info or non-empty query/fragment data rejects.
-  local uri_start = 1
-  while true do
-    local first, scheme, after = lower:match("()([a-z][a-z0-9+%.%-]*)://()", uri_start)
-    if not first then break end
-    if not previous_is(lower, first, "[A-Za-z0-9+%.%-]") then
-      local remainder = value:sub(after)
-      local at = remainder:find("@", 1, true)
-      if at then
-        local valid_userinfo = true
-        for index = 1, at - 1 do
-          local byte = remainder:byte(index)
-          if byte < 33 or byte > 126 or byte == 47 or byte == 64 then valid_userinfo = false; break end
-        end
-        if valid_userinfo then return true end
-      end
-      local token = remainder:match("^([!-~]+)") or ""
-      local marker = token:find("[?#]")
-      if marker and marker > 1 then
-        local kind = token:sub(marker, marker)
-        local following = token:sub(marker + 1, marker + 1)
-        if (kind == "?" and following ~= "" and following ~= "#") or (kind == "#" and following ~= "") then return true end
-      end
-    end
-    uri_start = after
-  end
-
-  local names = {
-    "access_token", "access-token", "accesstoken", "api_key", "api-key", "apikey", "authorization",
-    "credential", "password", "secret", "token",
-  }
-  for _, name in ipairs(names) do
-    for _, marker in ipairs({ "?", "&", "#" }) do
-      local query_start = 1
-      while true do
-        local _, last = find_plain(lower, marker .. name .. "=", query_start)
-        if not last then break end
-        local byte = lower:byte(last + 1)
-        if byte and byte >= 33 and byte <= 126 and byte ~= 35 and byte ~= 38 then return true end
-        query_start = last + 1
-      end
-    end
-    local start = 1
-    while true do
-      local first, last = find_plain(lower, name, start)
-      if not first then break end
-      if not previous_is(lower, first, "[A-Za-z0-9_%-]") and lower:sub(last + 1):match("^" .. whitespace .. "*[=:]" .. whitespace .. "*" .. ascii_value .. "+") then return true end
-      start = last + 1
-    end
-  end
-
-  local provider_patterns = {
-    { "ghs_", 36, "[A-Za-z0-9._%-]" },
-    { "gho_", 36, "[A-Za-z0-9]" }, { "ghp_", 36, "[A-Za-z0-9]" },
-    { "ghu_", 36, "[A-Za-z0-9]" }, { "ghr_", 36, "[A-Za-z0-9]" },
-    { "github_pat_", 20, "[A-Za-z0-9_]" },
-    { "glpat-", 20, "[A-Za-z0-9_%-]" }, { "glcbt-", 20, "[A-Za-z0-9_%-]" },
-    { "glptt-", 20, "[A-Za-z0-9_%-]" }, { "glrt-", 20, "[A-Za-z0-9_%-]" },
-    { "glimt-", 20, "[A-Za-z0-9_%-]" }, { "glsoat-", 20, "[A-Za-z0-9_%-]" },
-    { "gldt-", 20, "[A-Za-z0-9_%-]" }, { "glrtr-", 20, "[A-Za-z0-9_%-]" },
-    { "glft-", 20, "[A-Za-z0-9_%-]" }, { "glagent-", 20, "[A-Za-z0-9_%-]" },
-    { "glwt-", 20, "[A-Za-z0-9_%-]" }, { "glffct-", 20, "[A-Za-z0-9_%-]" },
-    { "gloas-", 20, "[A-Za-z0-9_%-]" },
-    { "sk-", 20, "[A-Za-z0-9_%-]" }, { "aiza", 30, "[A-Za-z0-9_%-]" },
-    { "hf_", 20, "[A-Za-z0-9]" },
-    { "xoxb-", 20, "[A-Za-z0-9%-]" }, { "xoxa-", 20, "[A-Za-z0-9%-]" },
-    { "xoxp-", 20, "[A-Za-z0-9%-]" }, { "xoxr-", 20, "[A-Za-z0-9%-]" },
-    { "xoxs-", 20, "[A-Za-z0-9%-]" }, { "xapp-", 20, "[A-Za-z0-9%-]" },
-    { "xwfp-", 20, "[A-Za-z0-9%-]" },
-    { "akia", 16, "[A-Za-z0-9]" }, { "asia", 16, "[A-Za-z0-9]" },
-  }
-  for _, item in ipairs(provider_patterns) do
-    if provider_token(value, lower, item[1], item[2], item[3]) then return true end
-  end
-  return lower:find("-----begin [a-z ]*private key-----") ~= nil
-end
-
 local function bounded_string(value)
   return type(value) == "string" and value ~= "" and #value <= M.MAX_DISPLAY_BYTES
-    and not value:find("[%z\1-\31\127]") and not contains_credential(value)
+    and not value:find("[%z\1-\31\127]") and not security.contains_credential(value)
 end
 
 local function is_null(value)
@@ -317,7 +195,8 @@ local function validate_run_fields(status)
   end
   if pushed_count ~= local_count then return false end
   if not fields(status.audit, { "phase", "pre_ci_round", "pre_ci_max_rounds", "remaining_effort" })
-    or not nullable_string(status.audit.phase) or not nonnegative_integer(status.audit.pre_ci_round) or not positive_integer(status.audit.pre_ci_max_rounds) or not nullable_string(status.audit.remaining_effort) then return false end
+    or not nullable_string(status.audit.phase) or not nonnegative_integer(status.audit.pre_ci_round) or not positive_integer(status.audit.pre_ci_max_rounds)
+    or status.audit.pre_ci_round > status.audit.pre_ci_max_rounds or not nullable_string(status.audit.remaining_effort) then return false end
   if not fields(status.ci, { "status", "attempt", "commit_sha" }) or not bounded_string(status.ci.status) or not nonnegative_integer(status.ci.attempt) or not nullable_string(status.ci.commit_sha) then return false end
   if not fields(status.counters, { "implementation_cycles", "ci_fix_attempts" }) or not nonnegative_integer(status.counters.implementation_cycles) or not nonnegative_integer(status.counters.ci_fix_attempts) then return false end
   if not fields(status.checklist, { "satisfied", "partial", "unsatisfied", "not_evaluated", "assessed_at" }) then return false end
@@ -361,21 +240,32 @@ function M.display(value)
 end
 
 function M.render(status)
-  if not status.run_exists then return { "Sprint Loop", "", "Sprint root: " .. M.display(status.sprint_root), "State: no run" } end
-  local lines = {
-    "Sprint Loop", "", "Sprint root: " .. M.display(status.sprint_root),
-    "Sprint: " .. M.display(status.sprint.multisprint) .. " / " .. status.sprint.index,
-    "State: " .. M.display(status.state) .. "    Process running: " .. tostring(status.process_running),
-  }
-  if not is_null(status.reason) then table.insert(lines, "Reason: " .. M.display(status.reason.code) .. ": " .. M.display(status.reason.message)) end
+  local lines = {}
+  local function add(line)
+    if security.contains_credential(line) then
+      table.insert(lines, "Status detail withheld: unsafe composed text")
+    else
+      table.insert(lines, line)
+    end
+  end
+  add("Sprint Loop"); add(""); add("Sprint root: " .. M.display(status.sprint_root))
+  if not status.run_exists then
+    add("State: no run")
+    add("Process running: " .. tostring(status.process_running))
+    add("Controller: " .. M.display(status.controller_version))
+    return lines
+  end
+  add("Sprint: " .. M.display(status.sprint.multisprint) .. " / " .. status.sprint.index)
+  add("State: " .. M.display(status.state) .. "    Process running: " .. tostring(status.process_running))
+  if not is_null(status.reason) then add("Reason: " .. M.display(status.reason.code) .. ": " .. M.display(status.reason.message)) end
   local active = status.active
   if not is_null(active.status) then
-    table.insert(lines, "Active: " .. M.display(active.role) .. " " .. M.display(active.invocation_id) .. " (" .. M.display(active.session_id) .. ")")
-    table.insert(lines, "Active status: " .. M.display(active.status))
-    if not is_null(active.interaction) then table.insert(lines, "WAITING FOR USER: question " .. active.interaction.question_count .. " at " .. M.display(active.interaction.asked_at)) end
+    add("Active: " .. M.display(active.role) .. " " .. M.display(active.invocation_id) .. " (" .. M.display(active.session_id) .. ")")
+    add("Active status: " .. M.display(active.status))
+    if not is_null(active.interaction) then add("WAITING FOR USER: question " .. active.interaction.question_count .. " at " .. M.display(active.interaction.asked_at)) end
   else
-    table.insert(lines, "Active: - - (-)")
-    table.insert(lines, "Active status: -")
+    add("Active: - - (-)")
+    add("Active status: -")
   end
   for _, kind in ipairs({ "local", "pushed" }) do
     local pairs_list = {}
@@ -383,15 +273,15 @@ function M.render(status)
     table.sort(pairs_list, function(left, right) return left[1] < right[1] end)
     local rendered = {}
     for _, item in ipairs(pairs_list) do table.insert(rendered, item[1] .. "=" .. M.display(item[2])) end
-    table.insert(lines, "Commits " .. kind .. ": " .. table.concat(rendered, ", "))
+    add("Commits " .. kind .. ": " .. table.concat(rendered, ", "))
   end
-  table.insert(lines, "Audit: " .. M.display(status.audit.phase) .. " round " .. tostring(status.audit.pre_ci_round) .. "/" .. tostring(status.audit.pre_ci_max_rounds) .. ", remaining effort " .. M.display(status.audit.remaining_effort))
-  table.insert(lines, "CI: " .. M.display(status.ci.status) .. " attempt " .. tostring(status.ci.attempt) .. ", commit " .. M.display(status.ci.commit_sha))
-  table.insert(lines, "Counters: implementations " .. status.counters.implementation_cycles .. ", CI fixes " .. status.counters.ci_fix_attempts)
-  table.insert(lines, "Checklist: " .. status.checklist.satisfied .. " satisfied, " .. status.checklist.partial .. " partial, " .. status.checklist.unsatisfied .. " unsatisfied, " .. status.checklist.not_evaluated .. " not evaluated; assessed " .. M.display(status.checklist.assessed_at))
-  if not is_null(status.last_event) then table.insert(lines, "Last event: #" .. status.last_event.sequence .. " " .. M.display(status.last_event.type) .. " at " .. M.display(status.last_event.timestamp))
-  else table.insert(lines, "Last event: -") end
-  table.insert(lines, "Controller: " .. M.display(status.controller_version) .. "    Updated: " .. M.display(status.updated_at))
+  add("Audit: " .. M.display(status.audit.phase) .. " round " .. tostring(status.audit.pre_ci_round) .. "/" .. tostring(status.audit.pre_ci_max_rounds) .. ", remaining effort " .. M.display(status.audit.remaining_effort))
+  add("CI: " .. M.display(status.ci.status) .. " attempt " .. tostring(status.ci.attempt) .. ", commit " .. M.display(status.ci.commit_sha))
+  add("Counters: implementations " .. status.counters.implementation_cycles .. ", CI fixes " .. status.counters.ci_fix_attempts)
+  add("Checklist: " .. status.checklist.satisfied .. " satisfied, " .. status.checklist.partial .. " partial, " .. status.checklist.unsatisfied .. " unsatisfied, " .. status.checklist.not_evaluated .. " not evaluated; assessed " .. M.display(status.checklist.assessed_at))
+  if not is_null(status.last_event) then add("Last event: #" .. status.last_event.sequence .. " " .. M.display(status.last_event.type) .. " at " .. M.display(status.last_event.timestamp))
+  else add("Last event: -") end
+  add("Controller: " .. M.display(status.controller_version) .. "    Updated: " .. M.display(status.updated_at))
   return lines
 end
 

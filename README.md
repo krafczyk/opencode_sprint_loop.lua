@@ -31,7 +31,8 @@ Setup resolves `sprint_root` and `executable` for its mandatory initial status
 observation. Every public action re-resolves the options it needs, including root
 and executable, so setup-time observation does not freeze later action values.
 Resolver lifetimes belong to the setup, watcher, or action that created them and
-are invalidated on replacement or Neovim exit.
+are invalidated on replacement or Neovim exit, including a result already
+arbitrated but still queued for delivery.
 
 All six commands are registered when the plugin loads, so invoking one before
 successful setup reports `setup_required` instead of an unknown command. A
@@ -70,7 +71,8 @@ require("opencode_sprint_loop").setup({
 ```
 
 When the optional `server_ca_cert` resolver is configured, it must resolve to
-an absolute readable regular file. Its path is supplied only as `SSL_CERT_FILE` to `run` and `resume` child
+an absolute readable regular file. Readability and file type are checked through
+asynchronous libuv open, fstat, and close callbacks. Its path is supplied only as `SSL_CERT_FILE` to `run` and `resume` child
 processes; it is neither placed in argv nor used to configure browser trust.
 Trust a private CA separately in the browser.
 
@@ -89,14 +91,21 @@ The module exports asynchronous `start()`, `progress()`, `pause()`,
 All controller commands use direct argv arrays, never a shell. Start launches
 `sprint-loop run --root <root> --server-url <url>` detached. A launch notice is
 not proof that the controller survived; use progress to confirm later
-`process_running` status. Controls delegate to the current controller. In the
+`process_running` status. Detached controller stdout and stderr are connected to
+`/dev/null`, not launcher-owned pipes, so later writes neither depend on Neovim
+nor expose controller output. If Neovim remains open, a separate bounded notice
+reports zero process exit and directs the user to progress without claiming the
+workflow reached a terminal state. Controls delegate to the current controller. In the
 Sprint 2-compatible controller, pause, resume, and stop accurately report
 the rejection as `controller_command_failed` without copying controller stderr;
 the controller's current reason remains `feature_not_implemented`, and the
 plugin does not simulate a state change.
-Before start or resume constructs argv, it requires `server_url` to be a
-credential-free HTTP(S) origin. User-info, paths, queries, fragments, malformed
-authorities, and other schemes are rejected without echoing the value.
+Before start or resume constructs argv, it requires the complete resolved
+`server_url` to be a credential-free HTTP(S) origin. User-info, paths, queries,
+fragments (including a non-empty fragment after an empty query), named-value or
+provider-token components, malformed authorities, and other schemes are rejected
+without echoing the value. The same complete-value credential scan runs on the
+resolved browser base before browser use.
 Controller stderr is never copied into a notification: non-zero exits and
 signal-terminated commands use a generic actionable diagnostic so credentials,
 credential-bearing URLs, and terminal controls from external processes cannot
@@ -108,6 +117,11 @@ safe reason, active session, commits, audit remaining effort, CI commit SHA,
 counters, all checklist counts and assessment time, and the last event sequence
 and time. Nullable evidence is rendered explicitly as `-`. Server URLs,
 credentials, prompts, transcripts, and question text are never displayed.
+The no-run view explicitly includes the root, `process_running: false`, and the
+controller version. A pre-CI round greater than its configured maximum is
+inconsistent. Every final display line is scanned again so otherwise safe fields
+cannot compose an authorization or named credential across a join; such a line
+is replaced by a fixed withheld-detail notice.
 If interruption leaves a durable active invocation, progress accepts and shows
 its truthful `running` status even when `process_running` is false; this does
 not claim that a controller process is alive. Blocked, failed, and stopped
@@ -145,6 +159,11 @@ answers questions, writes files, or changes controller state.
 through Neovim. Missing web configuration, no active session, invalid web URL,
 and browser failures are actionable notifications. Browser-facing URLs must be
 credential-free HTTP(S) bases.
+Neovim 0.12 returns an asynchronous handler process. The plugin observes that
+handle without waiting on the interaction path, reports terminal success only
+after a zero exit, and reports non-zero or signalled completion as
+`browser_open_failed`. A missing handler fails immediately; an overridden handler
+whose completion cannot be observed receives a warning and no success claim.
 Deployment path prefixes may use RFC 3986 path characters and valid percent
 escapes. Raw spaces, malformed percent escapes, backslashes, and other invalid
 URL characters are rejected.
@@ -167,8 +186,8 @@ nvim --headless --noplugin -u tests/minimal_init.lua -l tests/run.lua
 The suite covers the setup/API, argv, streaming output bounds, complete status
 matrix, float lifecycle, watcher lifecycle, URL/browser behavior, and CA child
 environment. It also launches the repository fake executable from a nested
-headless Neovim and proves that the detached child records completion after the
-launcher exits.
+headless Neovim and proves that the detached child writes both output streams and
+records completion after the launcher exits without disclosing either stream.
 
 A real-server/mkchad demonstration is opt-in and is not performed by this
 suite. Sprint 3 supports presentation of a fixture-only waiting status; real

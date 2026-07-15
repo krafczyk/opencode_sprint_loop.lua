@@ -26,11 +26,14 @@ string synchronously and receive no completion callback. Only `server_url` and
 URL function results remain private for a five-second arbitration window so
 delayed return-plus-callback or duplicate completion rejects before launch.
 `executable` defaults to `sprint-loop`. `web_url` is used only by
-|SprintLoopOpenSession|. `server_ca_cert`, when supplied, resolves to an absolute readable regular file
-passed only as SSL_CERT_FILE to `run` and `resume`; browser CA trust is separate.
+|SprintLoopOpenSession|. `server_ca_cert`, when supplied, resolves to an
+absolute readable regular file. Readability and file type are checked through
+asynchronous libuv open/fstat/close callbacks. The path is passed only as
+SSL_CERT_FILE to `run` and `resume`; browser CA trust is separate.
 Setup resolves root and executable for its mandatory initial status observation;
 later actions re-resolve every option they need. Resolver lifetimes are owned by
-their setup, watcher, or action lifecycle.
+their setup, watcher, or action lifecycle, including arbitrated results still
+queued for delivery.
 Commands are registered at plugin load. Before successful setup they report
 `setup_required`; repeated setup replaces configuration and watcher state while
 preserving pending-request notification deduplication for this Neovim process.
@@ -51,12 +54,17 @@ The equivalent public methods are `start`, `progress`, `pause`, `resume`,
 return a stable process/status/workflow result. The progress window is
 read-only; buffer-local `q` and `Esc` close it.
 
-Before `run` or `resume` argv is constructed, `server_url` must be a
-credential-free HTTP(S) origin. Malformed authorities, user-info, paths,
-queries, fragments, and unsupported schemes are rejected without echoing the
-value. Process stdout and stderr are bounded during asynchronous streaming.
+Before `run` or `resume` argv is constructed, the complete `server_url` must be
+a credential-free HTTP(S) origin. Malformed authorities, user-info, paths,
+queries, fragments, named-value/provider-token components, and unsupported
+schemes are rejected without echoing the value. Browser bases receive the same
+complete-value credential scan. Non-detached process stdout and stderr are
+bounded during asynchronous streaming.
 External stderr is not copied into notifications; non-zero exits and non-zero
 process signals use a generic diagnostic directing the user to progress.
+Detached `run` stdout/stderr use `/dev/null`, not Neovim-owned pipes. A zero
+process exit gets a distinct notice directing the user to progress and never
+claims that workflow state is terminal.
 
 WATCHER                                                         *SprintLoop-watcher*
 
@@ -83,6 +91,9 @@ PROGRESS                                                        *SprintLoop-prog
 The float includes audit remaining effort, CI commit SHA, all checklist counts
 including `not_evaluated`, checklist assessment time, and the last event
 sequence. Relevant null evidence is shown as `-` rather than omitted.
+No-run includes root, `process_running: false`, and controller version. A pre-CI
+round above its configured maximum is inconsistent. Final composed lines receive
+another credential scan; an unsafe cross-field join is replaced by fixed text.
 An interrupted durable active invocation may display `running` while
 `process_running` is false; this does not claim that the controller is alive.
 Blocked, failed, and stopped projections require a reason.
@@ -111,6 +122,10 @@ belong in user setup and are not hard-coded by the plugin.
 Browser path prefixes accept RFC 3986 path characters and valid percent
 escapes; raw spaces, malformed escapes, backslashes, and invalid URL characters
 are rejected.
+Neovim 0.12 browser-handler completion is observed asynchronously. Zero exit is
+reported as success; non-zero or signalled completion reports
+`browser_open_failed`. Missing handlers fail immediately. Unobservable overridden
+handlers receive a warning and no terminal-success claim.
 
 CONTROLS                                                        *SprintLoop-controls*
 

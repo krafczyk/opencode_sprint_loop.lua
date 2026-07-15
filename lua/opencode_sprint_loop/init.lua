@@ -26,6 +26,7 @@ local state = {
   action_id = 0,
   status_active = nil,
   status_queue = {},
+  openers = {},
   exiting = false,
 }
 
@@ -34,7 +35,14 @@ local function notify(message, level)
 end
 
 local function current(generation)
-  return state.options ~= nil and state.generation == generation
+  return not state.exiting and state.options ~= nil and state.generation == generation
+end
+
+local function cancel_openers()
+  for timer in pairs(state.openers) do
+    if not timer:is_closing() then timer:stop(); timer:close() end
+    state.openers[timer] = nil
+  end
 end
 
 local function cancel_resolvers(kind, identifier)
@@ -159,9 +167,14 @@ local function ca_environment(generation, owner, predicate, callback)
   local value = state.options.server_ca_cert
   if not value then callback(nil, nil); return end
   resolve_value(value, generation, owner, predicate or current, function(path, error)
-    if error then callback(nil, error)
-    elseif not config.valid_ca_path(path) then callback(nil, "invalid_server_ca_cert")
-    else callback({ SSL_CERT_FILE = path }, nil) end
+    if error then callback(nil, error); return end
+    local validation
+    validation = config.validate_ca_path(path, generation, predicate or current, function(valid)
+      if validation then state.resolvers[validation] = nil end
+      if valid then callback({ SSL_CERT_FILE = path }, nil)
+      else callback(nil, "invalid_server_ca_cert") end
+    end)
+    if validation.is_active() then state.resolvers[validation] = owner end
   end)
 end
 
@@ -301,7 +314,9 @@ local function controller_action(name)
             if launch_watcher_id then finish_launch(root, generation, launch_watcher_id) end
             local error = command_error(result, spawn_error)
             if error then notify(error); return end
-            if name ~= "run" and name ~= "resume" then
+            if name == "run" or name == "resume" then
+              notify("controller " .. name .. " process exited successfully; inspect progress for workflow state", vim.log.levels.INFO)
+            else
               notify(name .. " delegated", vim.log.levels.INFO)
             end
           end)
@@ -337,6 +352,7 @@ function M.setup(options)
   if not supported then notify("unsupported_neovim: Neovim 0.12 or newer is required"); return end
   local validated, error = config.validate(options)
   if not validated then notify(error); return end
+  cancel_openers()
   cancel_resolvers()
   cancel_status_requests()
   state.generation = state.generation + 1
@@ -396,8 +412,32 @@ function M.open_session()
         local target = normalized .. "/" .. root64 .. "/session/" .. session
         local opener = browser_override or vim.ui.open
         local ok, handle, open_error = pcall(opener, target)
-        if not ok or handle == nil or open_error ~= nil then notify("browser_open_failed")
-        else notify("opened active session", vim.log.levels.INFO) end
+        if not ok or handle == nil or open_error ~= nil then notify("browser_open_failed"); return end
+        if type(handle.is_closing) ~= "function" or type(handle.wait) ~= "function" then
+          notify("browser launch requested; handler completion unavailable", vim.log.levels.WARN)
+          return
+        end
+        local timer = vim.uv.new_timer()
+        state.openers[timer] = true
+        local function close()
+          state.openers[timer] = nil
+          if not timer:is_closing() then timer:stop(); timer:close() end
+        end
+        timer:start(0, 50, vim.schedule_wrap(function()
+          if not current(generation) then close(); return end
+          local observed, closing = pcall(handle.is_closing, handle)
+          if not observed then close(); notify("browser_open_failed"); return end
+          if not closing then return end
+          close()
+          -- is_closing() means the process has reached terminal completion;
+          -- wait() only retrieves the retained result and does not block here.
+          local waited, result = pcall(handle.wait, handle)
+          if not waited or type(result) ~= "table" or result.code ~= 0 or (type(result.signal) == "number" and result.signal ~= 0) then
+            notify("browser_open_failed")
+          else
+            notify("opened active session", vim.log.levels.INFO)
+          end
+        end))
       end)
     end)
   end)
@@ -412,6 +452,7 @@ function M._test_replace_watcher(root)
 end
 function M._test_reset()
   local next_generation = state.generation + 1
+  cancel_openers()
   cancel_resolvers()
   cancel_status_requests()
   invalidate_watcher()
@@ -431,6 +472,7 @@ function M._test_reset()
     action_id = 0,
     status_active = nil,
     status_queue = {},
+    openers = {},
     exiting = false,
   }
   browser_override = nil
@@ -440,6 +482,7 @@ end
 
 vim.api.nvim_create_autocmd("VimLeavePre", { callback = function()
   state.exiting = true
+  cancel_openers()
   cancel_resolvers()
   cancel_status_requests()
   invalidate_watcher()

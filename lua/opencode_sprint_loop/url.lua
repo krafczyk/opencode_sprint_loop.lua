@@ -1,5 +1,6 @@
 --- Credential-safe HTTP(S) URL validation without compatibility-only APIs.
 local M = {}
+local security = require("opencode_sprint_loop.security")
 
 local function valid_port(port)
   if port == nil then return true end
@@ -60,6 +61,7 @@ end
 
 local function parse(value, allow_path)
   if type(value) ~= "string" or value == "" or value:find("[%z\1-\31\127]") then return nil end
+  if security.contains_credential(value) then return nil end
   if value:find("?", 1, true) or value:find("#", 1, true) then return nil end
   local scheme, remainder = value:match("^([%a][%w+%.%-]*)://(.+)$")
   if scheme then scheme = scheme:lower() end
