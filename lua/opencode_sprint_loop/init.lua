@@ -61,8 +61,9 @@ local function command_error(result, error)
   if error then return error end
   if type(result) ~= "table" then return "process_spawn_failed" end
   if result.code ~= 0 then
-    local detail = type(result.stderr) == "string" and result.stderr ~= "" and result.stderr:gsub("[\r\n]+", " ") or "controller command failed"
-    return "controller_command_failed: " .. detail:sub(1, 512)
+    -- External stderr can contain credentials, URLs, terminal controls, or
+    -- arbitrary service output. Do not attempt partial sanitization here.
+    return "controller_command_failed: inspect controller status with :SprintLoopProgress"
   end
 end
 
@@ -88,6 +89,7 @@ local function query_status(root, generation, callback)
       if not current(generation) then return end
       local error = command_error(result, spawn_error)
       if error then callback(nil, error); return end
+      if result.stdout_truncated == true then callback(nil, "status_output_too_large"); return end
       local decoded, decode_error = status.decode(result.stdout)
       if not decoded then callback(nil, decode_error); return end
       callback(decoded, nil)
@@ -199,7 +201,7 @@ local function controller_action(name)
             local error = command_error(result, spawn_error)
             if error then notify(error); return end
             if name ~= "run" and name ~= "resume" then
-              notify(result.stdout ~= "" and result.stdout:sub(1, 512) or name .. " delegated", vim.log.levels.INFO)
+              notify(name .. " delegated", vim.log.levels.INFO)
             end
           end)
         end)

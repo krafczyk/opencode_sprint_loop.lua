@@ -21,6 +21,7 @@ local function collector()
       local result = table.concat(chunks)
       return truncated and result .. marker or result
     end,
+    truncated = function() return truncated end,
   }
 end
 
@@ -41,7 +42,14 @@ local function system_runner(argv, options, callback)
       if error then stderr:add("standard error read failed") else stderr:add(data) end
     end,
   }, function(result)
-    callback({ code = result.code, signal = result.signal, stdout = stdout.value(), stderr = stderr.value() })
+    callback({
+      code = result.code,
+      signal = result.signal,
+      stdout = stdout.value(),
+      stderr = stderr.value(),
+      stdout_truncated = stdout.truncated(),
+      stderr_truncated = stderr.truncated(),
+    })
   end)
 end
 

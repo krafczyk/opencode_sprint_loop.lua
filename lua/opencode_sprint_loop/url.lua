@@ -42,6 +42,22 @@ local function valid_authority(authority)
   return port == ""
 end
 
+local function valid_path(path)
+  local index = 1
+  while index <= #path do
+    local character = path:sub(index, index)
+    if character == "%" then
+      if not path:sub(index + 1, index + 2):match("^%x%x$") then return false end
+      index = index + 3
+    elseif character:match("^[%w%-%._~!%$&'%(%)%*%+,;=:@/]$") then
+      index = index + 1
+    else
+      return false
+    end
+  end
+  return true
+end
+
 local function parse(value, allow_path)
   if type(value) ~= "string" or value == "" or value:find("[%z\1-\31\127]") then return nil end
   if value:find("?", 1, true) or value:find("#", 1, true) then return nil end
@@ -51,7 +67,7 @@ local function parse(value, allow_path)
   local authority, path = remainder:match("^([^/]*)(/.*)$")
   if authority == nil then authority, path = remainder, "" end
   if not valid_authority(authority) then return nil end
-  if path:find("\\", 1, true) or (not allow_path and path ~= "" and path ~= "/") then return nil end
+  if not valid_path(path) or (not allow_path and path ~= "" and path ~= "/") then return nil end
   return { scheme = scheme, authority = authority, path = path }
 end
 

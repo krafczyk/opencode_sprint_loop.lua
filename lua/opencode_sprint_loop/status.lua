@@ -150,7 +150,9 @@ end
 local function validate_active(active, running)
   if type(active) ~= "table" or not fields(active, { "role", "invocation_id", "session_id", "status", "interaction" }) then return false end
   if is_null(active.status) then return is_null(active.role) and is_null(active.invocation_id) and is_null(active.session_id) and is_null(active.interaction) end
-  if active.status == "running" then return running and bounded_string(active.role) and bounded_string(active.invocation_id) and bounded_string(active.session_id) and is_null(active.interaction) end
+  -- The active invocation is durable evidence. It remains truthful after an
+  -- interrupted controller lifetime even when process_running is false.
+  if active.status == "running" then return bounded_string(active.role) and bounded_string(active.invocation_id) and bounded_string(active.session_id) and is_null(active.interaction) end
   if active.status ~= "waiting_for_user" or not running then return false end
   local interaction = active.interaction
   return bounded_string(active.role) and bounded_string(active.invocation_id) and bounded_string(active.session_id)
@@ -178,6 +180,8 @@ local function validate_run_fields(status)
   if not fields(status.checklist, { "satisfied", "partial", "unsatisfied", "not_evaluated", "assessed_at" }) then return false end
   for _, key in ipairs({ "satisfied", "partial", "unsatisfied", "not_evaluated" }) do if not nonnegative_integer(status.checklist[key]) then return false end end
   if not nullable_string(status.checklist.assessed_at) or not nullable_string(status.updated_at) then return false end
+  local reason_required = status.state == "blocked" or status.state == "failed" or status.state == "stopped"
+  if reason_required and is_null(status.reason) then return false end
   if not is_null(status.reason) and (not fields(status.reason, { "code", "message" }) or not bounded_string(status.reason.code) or not bounded_string(status.reason.message)) then return false end
   return is_null(status.last_event) or (fields(status.last_event, { "sequence", "type", "timestamp" }) and positive_integer(status.last_event.sequence) and bounded_string(status.last_event.type) and bounded_string(status.last_event.timestamp))
 end

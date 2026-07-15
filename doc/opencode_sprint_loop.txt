@@ -21,8 +21,10 @@ SETUP                                                            *SprintLoop-set
 
 `sprint_root` and `server_url` are required. All fields accept a string or a
 resolver. Resolvers run at action time. They may return a string or call
-`done(value, error)` exactly once; callback resolution times out after five
-seconds. `executable` defaults to `sprint-loop`. `web_url` is used only by
+`done(value, error)` exactly once. Function results remain private for a
+five-second arbitration window so delayed return-plus-callback or duplicate
+completion is rejected before an action launches. `executable` defaults to
+`sprint-loop`. `web_url` is used only by
 |SprintLoopOpenSession|. `server_ca_cert`, when supplied, resolves to an absolute readable regular file
 passed only as SSL_CERT_FILE to `run` and `resume`; browser CA trust is separate.
 Commands are registered at plugin load. Before successful setup they report
@@ -47,11 +49,15 @@ Before `run` or `resume` argv is constructed, `server_url` must be a
 credential-free HTTP(S) origin. Malformed authorities, user-info, paths,
 queries, fragments, and unsupported schemes are rejected without echoing the
 value. Process stdout and stderr are bounded during asynchronous streaming.
+External stderr is not copied into notifications; non-zero exits use a generic
+diagnostic directing the user to progress.
 
 WATCHER                                                         *SprintLoop-watcher*
 
-Setup and successful start/resume begin a single two-second, non-overlapping
-status watcher. A future `waiting_for_user` projection produces one notification
+Setup performs one asynchronous status observation and starts the single
+two-second, non-overlapping watcher only if a running controller is found.
+Successful start/resume also begins launch discovery. A future
+`waiting_for_user` projection produces one notification
 per request ID directing the user to |SprintLoopOpenSession|. It does not expose
 question content or submit an answer. Sprint 2's probe is non-interactive;
 waiting is a controlled-fixture compatibility demonstration until Sprint 4.
@@ -63,6 +69,9 @@ PROGRESS                                                        *SprintLoop-prog
 The float includes audit remaining effort, CI commit SHA, all checklist counts
 including `not_evaluated`, checklist assessment time, and the last event
 sequence. Relevant null evidence is shown as `-` rather than omitted.
+An interrupted durable active invocation may display `running` while
+`process_running` is false; this does not claim that the controller is alive.
+Blocked, failed, and stopped projections require a reason.
 
 SECURITY                                                        *SprintLoop-security*
 
@@ -75,12 +84,16 @@ never call a server `ensure`/start function. Do not test against the live
 The current adapter shape is `vim.g.opencode_opts.server.url(done)` for the
 existing URL and `vim.g.opencode_opts.server.ca_cert()` for the CA path; these
 belong in user setup and are not hard-coded by the plugin.
+Browser path prefixes accept RFC 3986 path characters and valid percent
+escapes; raw spaces, malformed escapes, backslashes, and invalid URL characters
+are rejected.
 
 CONTROLS                                                        *SprintLoop-controls*
 
 The current Sprint 2 controller responds `feature_not_implemented` for pause,
-resume, and stop. The plugin displays that controller response and makes no
-local state transition. Recovery behavior is not implemented here.
+resume, and stop. The plugin reports a generic `controller_command_failed`
+without copying external stderr and makes no local state transition. Recovery
+behavior is not implemented here.
 
 ERRORS                                                          *SprintLoop-errors*
 
@@ -97,3 +110,30 @@ The client requires the complete Sprint 3 schema-version-one status projection.
 An unsupported or inconsistent projection fails closed; update controller and
 plugin together when their compatibility contracts differ. Desktop notification
 and URL-handler availability remain properties of the operator environment.
+
+REAL DEMONSTRATION                                      *SprintLoop-real-demo*
+
+The opt-in real procedure is intentionally not part of default verification.
+Use a disposable clean sprint-history repository, disposable controller venv,
+externally started supported server, synthetic inherited password, optional
+disposable regular-file CA, and isolated XDG roots. Never use or inspect the
+live ~/.config/mkchad runtime. Put this checkout on `runtimepath`, configure the
+explicit executable/root/server/web/CA values, then run an isolated Neovim with
+an outer bound from a unique root created by `mktemp -d` such as:
+
+>sh
+  timeout 15m env \
+    XDG_CONFIG_HOME="$SPRINT_LOOP_DEMO_TEMP/config" \
+    XDG_STATE_HOME="$SPRINT_LOOP_DEMO_TEMP/state" \
+    XDG_DATA_HOME="$SPRINT_LOOP_DEMO_TEMP/data" \
+    XDG_CACHE_HOME="$SPRINT_LOOP_DEMO_TEMP/cache" \
+    nvim --clean -u "$SPRINT_LOOP_DEMO_TEMP/init.lua"
+<
+
+Run |SprintLoopStart|, |SprintLoopProgress|, and |SprintLoopOpenSession|. Close
+and reopen that isolated Neovim to observe setup-time rediscovery. The current
+probe ends at `blocked/execution_not_implemented`; waiting remains fixture-only.
+Stop the external server yourself, unset synthetic credentials, and remove only
+the disposable roots. See the repository README for the complete reproducible
+environment and init-file example. This procedure does not claim that an
+external OpenCode, browser, or private-CA demonstration has been performed.

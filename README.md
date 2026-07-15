@@ -20,7 +20,10 @@ require("opencode_sprint_loop").setup({
 `setup()` is required before every action. Each option accepts a non-empty
 string or a resolver. Resolvers are evaluated when needed, not at setup time;
 they may synchronously return a string or call `done(value, error)` once. A
-callback resolver has a five-second bound. The required `sprint_root` and
+function resolver has a five-second arbitration window. The plugin does not
+consume even a synchronous return until that window closes, because the same
+function could invoke `done` later; return-plus-callback and duplicate callback
+completion are rejected before an action launches. The required `sprint_root` and
 `server_url` are not discovered or guessed.
 
 All six commands are registered when the plugin loads, so invoking one before
@@ -79,10 +82,15 @@ All controller commands use direct argv arrays, never a shell. Start launches
 not proof that the controller survived; use progress to confirm later
 `process_running` status. Controls delegate to the current controller. In the
 Sprint 2-compatible controller, pause, resume, and stop accurately report
-`feature_not_implemented`; the plugin does not simulate a state change.
+the rejection as `controller_command_failed` without copying controller stderr;
+the controller's current reason remains `feature_not_implemented`, and the
+plugin does not simulate a state change.
 Before start or resume constructs argv, it requires `server_url` to be a
 credential-free HTTP(S) origin. User-info, paths, queries, fragments, malformed
 authorities, and other schemes are rejected without echoing the value.
+Controller stderr is never copied into a notification: non-zero exits use a
+generic actionable diagnostic so credentials, credential-bearing URLs, and
+terminal controls from external processes cannot be exposed.
 
 Progress calls `status --json` asynchronously and opens a disposable centered,
 read-only float. `q` and `Esc` close that buffer. It displays no-run, state,
@@ -90,10 +98,16 @@ safe reason, active session, commits, audit remaining effort, CI commit SHA,
 counters, all checklist counts and assessment time, and the last event sequence
 and time. Nullable evidence is rendered explicitly as `-`. Server URLs,
 credentials, prompts, transcripts, and question text are never displayed.
+If interruption leaves a durable active invocation, progress accepts and shows
+its truthful `running` status even when `process_running` is false; this does
+not claim that a controller process is alive. Blocked, failed, and stopped
+status documents require a reason.
 
-After setup and start/resume, one ephemeral watcher polls at a bounded
-two-second interval with at most one status process in flight. It stops after
-an observed controller exits (including a final launch-completion observation)
+Setup first performs one asynchronous status observation; it starts the single
+ephemeral watcher only when that observation reports a running controller.
+Successful start/resume launches also begin discovery. The watcher polls at a
+bounded two-second interval with at most one status process in flight. It stops
+after an observed controller exits (including a final launch-completion observation)
 and emits one notification per pending request ID
 for future-compatible `waiting_for_user` status. It never reads question text,
 answers questions, writes files, or changes controller state.
@@ -103,6 +117,9 @@ answers questions, writes files, or changes controller state.
 through Neovim. Missing web configuration, no active session, invalid web URL,
 and browser failures are actionable notifications. Browser-facing URLs must be
 credential-free HTTP(S) bases.
+Deployment path prefixes may use RFC 3986 path characters and valid percent
+escapes. Raw spaces, malformed percent escapes, backslashes, and other invalid
+URL characters are rejected.
 
 The plugin requires the complete schema-version-one status projection described
 for Sprint 3. Unsupported schemas or missing/inconsistent fields fail closed;
@@ -129,3 +146,58 @@ A real-server/mkchad demonstration is opt-in and is not performed by this
 suite. Sprint 3 supports presentation of a fixture-only waiting status; real
 Builder questions begin in Sprint 4, while functional pause/recovery controls
 belong to Sprint 7.
+
+### Safety-bounded opt-in real demonstration
+
+Use only a disposable clean sprint-history repository and an externally
+started supported OpenCode server rooted there. Do not point any variable below
+at `~/.config/mkchad`, and do not reuse its server, CA, credentials, or XDG
+directories. Install the controller in a disposable virtual environment, put
+this plugin checkout on the runtime path, create a uniquely named temporary root
+with `export SPRINT_LOOP_DEMO_TEMP="$(mktemp -d /tmp/opencode-sprint-loop-demo.XXXXXX)"`,
+and write the following init file to
+`$SPRINT_LOOP_DEMO_TEMP/init.lua`:
+
+```lua
+vim.opt.runtimepath:append(assert(vim.env.SPRINT_LOOP_PLUGIN_ROOT))
+require("opencode_sprint_loop").setup({
+  executable = assert(vim.env.SPRINT_LOOP_EXECUTABLE),
+  sprint_root = assert(vim.env.SPRINT_LOOP_DEMO_ROOT),
+  server_url = assert(vim.env.SPRINT_LOOP_DEMO_SERVER_URL),
+  web_url = assert(vim.env.SPRINT_LOOP_DEMO_WEB_URL),
+  server_ca_cert = vim.env.SPRINT_LOOP_DEMO_CA,
+})
+```
+
+After independently verifying that the root and optional CA are disposable,
+regular paths and that `git -C "$SPRINT_LOOP_DEMO_ROOT" status --porcelain`
+is empty, launch an isolated Neovim with a finite outer bound:
+
+```bash
+export SPRINT_LOOP_PLUGIN_ROOT="$PWD"
+test -n "$SPRINT_LOOP_DEMO_TEMP"
+export SPRINT_LOOP_EXECUTABLE=/absolute/path/to/disposable-venv/bin/sprint-loop
+export SPRINT_LOOP_DEMO_ROOT=/absolute/path/to/disposable-sprint
+export SPRINT_LOOP_DEMO_SERVER_URL=https://127.0.0.1:4096
+export SPRINT_LOOP_DEMO_WEB_URL=https://127.0.0.1:4096
+export SPRINT_LOOP_DEMO_CA=/absolute/path/to/disposable-ca.pem  # omit for HTTP/public CA
+export OPENCODE_SERVER_PASSWORD=synthetic-demo-password
+mkdir -p "$SPRINT_LOOP_DEMO_TEMP"/{config,state,data,cache}
+timeout 15m env \
+  XDG_CONFIG_HOME="$SPRINT_LOOP_DEMO_TEMP/config" \
+  XDG_STATE_HOME="$SPRINT_LOOP_DEMO_TEMP/state" \
+  XDG_DATA_HOME="$SPRINT_LOOP_DEMO_TEMP/data" \
+  XDG_CACHE_HOME="$SPRINT_LOOP_DEMO_TEMP/cache" \
+  nvim --clean -u "$SPRINT_LOOP_DEMO_TEMP/init.lua"
+```
+
+In Neovim run `:SprintLoopStart`, `:SprintLoopProgress`, and, after an active
+session appears, `:SprintLoopOpenSession`. Close Neovim during the probe, reopen
+with the same bounded command, and use progress to verify setup-time
+rediscovery. The expected current controller result is
+`blocked/execution_not_implemented`; waiting-for-user remains fixture-only.
+Stop the externally managed server yourself, inspect only credential-free
+status/evidence, unset the variables (especially the synthetic password), and
+remove only the uniquely named disposable temporary root, virtual environment, sprint fixture, and
+CA. This procedure is documentation, not evidence that the external
+OpenCode/browser/private-CA gates have been performed.

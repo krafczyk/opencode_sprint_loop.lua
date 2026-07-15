@@ -74,41 +74,47 @@ function M.resolve(value, generation, current, callback)
     elseif not valid_resolved(result) then callback(nil, "invalid_resolved_value")
     else callback(result, nil) end
   end
-  local settle_scheduled = false
-  local function settle()
-    if completed or not resolver_returned or settle_scheduled then return end
-    settle_scheduled = true
-    vim.schedule(function()
-      settle_scheduled = false
-      if completed then return end
-      if callback_count > 1 or (callback_count > 0 and return_value ~= nil) then
-        finish(nil, "duplicate completion")
-      elseif return_value ~= nil then
-        finish(return_value, nil)
-      elseif callback_count == 1 then
-        finish(callback_result, callback_error)
-      end
-    end)
+  local function arbitrate()
+    if completed or not resolver_returned then return end
+    if callback_count > 1 or (callback_count > 0 and return_value ~= nil) then
+      finish(nil, "duplicate completion")
+    elseif return_value ~= nil then
+      finish(return_value, nil)
+    elseif callback_count == 1 then
+      finish(callback_result, callback_error)
+    else
+      finish(nil, "timeout")
+    end
   end
-  timer:start(M.RESOLVER_TIMEOUT_MS, 0, vim.schedule_wrap(function() finish(nil, "timeout") end))
+  -- A function may return synchronously and invoke its callback later. Keep the
+  -- result private for the complete callback window so dual completion cannot
+  -- launch an action before it is rejected.
+  timer:start(M.RESOLVER_TIMEOUT_MS, 0, vim.schedule_wrap(arbitrate))
   local ok, returned = xpcall(function()
     return value(function(result, error)
       if completed then return end
       callback_count = callback_count + 1
       if callback_count == 1 then callback_result, callback_error = result, error end
-      settle()
+      if resolver_returned and (callback_count > 1 or return_value ~= nil) then
+        finish(nil, "duplicate completion")
+      end
     end)
   end, debug.traceback)
   resolver_returned = true
   return_value = returned
   if not ok then
     finish(nil, "exception")
-  else settle() end
+  elseif callback_count > 1 or (callback_count > 0 and return_value ~= nil) then
+    finish(nil, "duplicate completion")
+  end
 end
 
 function M.valid_ca_path(path)
-  return type(path) == "string" and vim.startswith(path, "/") and not path:find("[%z\1-\31\127]")
-    and vim.fn.filereadable(path) == 1 and vim.fn.isdirectory(path) == 0
+  if type(path) ~= "string" or path:sub(1, 1) ~= "/" or path:find("[%z\1-\31\127]") then
+    return false
+  end
+  local details = vim.uv.fs_stat(path)
+  return details ~= nil and details.type == "file" and vim.fn.filereadable(path) == 1
 end
 
 return M
