@@ -1,6 +1,7 @@
 --- Narrow asynchronous controller-process adapter.
 local M = { MAX_OUTPUT = 64 * 1024 }
 local override = nil
+local detached_runtime_override = nil
 
 local function collector()
   local chunks, size, truncated = {}, 0, false
@@ -29,21 +30,54 @@ function M.set_runner_for_test(runner)
   override = runner
 end
 
+function M.set_detached_runtime_for_test(runtime)
+  detached_runtime_override = runtime
+end
+
+local function detached_runtime()
+  return detached_runtime_override or {
+    fs_open = vim.uv.fs_open,
+    fs_close = vim.uv.fs_close,
+    spawn = vim.uv.spawn,
+  }
+end
+
+local function spawn_allowed(options)
+  if type(options.spawn_gate) ~= "function" then return true end
+  local ok, allowed = pcall(options.spawn_gate)
+  return ok and allowed == true
+end
+
 local function system_runner(argv, options, callback)
   local stdout, stderr = collector(), collector()
   local detached = options.detach == true
   if detached then
     local proxy = { _spawn_pending = true }
     local process_handle
-    function proxy.kill(_, signal)
-      if process_handle and not process_handle:is_closing() then process_handle:kill(signal) end
+    local runtime = detached_runtime()
+    if not spawn_allowed(options) then
+      vim.schedule(function() callback(nil, "process_spawn_cancelled") end)
+      return proxy
     end
-    vim.uv.fs_open("/dev/null", "w", 438, function(open_error, null_descriptor)
+    runtime.fs_open("/dev/null", "w", 438, function(open_error, null_descriptor)
       if open_error or not null_descriptor then
         callback(nil, "process_spawn_failed")
         return
       end
+      local function close_null(on_close)
+        runtime.fs_close(null_descriptor, function()
+          if on_close then on_close() end
+        end)
+      end
+      if not spawn_allowed(options) then
+        close_null(function() callback(nil, "process_spawn_cancelled") end)
+        return
+      end
       vim.schedule(function()
+        if not spawn_allowed(options) then
+          close_null(function() callback(nil, "process_spawn_cancelled") end)
+          return
+        end
         local arguments = {}
         for index = 2, #argv do table.insert(arguments, argv[index]) end
         local handle, spawn_error
@@ -57,7 +91,7 @@ local function system_runner(argv, options, callback)
           vim.env[key] = tostring(value)
         end
         local spawned, spawn_failure = pcall(function()
-          handle, spawn_error = vim.uv.spawn(argv[1], {
+          handle, spawn_error = runtime.spawn(argv[1], {
             args = arguments,
             detached = true,
             stdio = { nil, null_descriptor, null_descriptor },
@@ -76,7 +110,7 @@ local function system_runner(argv, options, callback)
         for key, value in pairs(prior_environment) do vim.env[key] = value == false and nil or value end
         if not spawned then spawn_error = spawn_failure end
         process_handle = handle
-        vim.uv.fs_close(null_descriptor, function() end)
+        close_null()
         if not handle then
           callback(nil, spawn_error or "process_spawn_failed")
           return

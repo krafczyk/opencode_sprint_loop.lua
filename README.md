@@ -15,6 +15,7 @@ For a manual native-package installation, clone the repository beneath a
 `pack/*/start` directory and generate tags for its `doc` directory explicitly:
 
 ```bash
+mkdir -p ~/.local/share/nvim/site/pack/sprint-loop/start
 git clone git@github.com:krafczyk/opencode_sprint_loop.lua.git \
   ~/.local/share/nvim/site/pack/sprint-loop/start/opencode_sprint_loop.lua
 nvim --headless \
@@ -113,7 +114,11 @@ not proof that the controller survived; use progress to confirm later
 `/dev/null`, not launcher-owned pipes, so later writes neither depend on Neovim
 nor expose controller output. If Neovim remains open, a separate bounded notice
 reports zero process exit and directs the user to progress without claiming the
-workflow reached a terminal state. Controls delegate to the current controller. In the
+workflow reached a terminal state. The asynchronous `/dev/null` open and queued
+spawn are generation- and exit-gated: setup replacement or `VimLeavePre` closes
+the pending descriptor and suppresses a stale launch, watcher mutation, and
+launch notice. Once a controller has spawned successfully, replacement never
+signals it. Controls delegate to the current controller. In the
 Sprint 2-compatible controller, pause, resume, and stop accurately report
 the rejection as `controller_command_failed` without copying controller stderr;
 the controller's current reason remains `feature_not_implemented`, and the
@@ -177,10 +182,12 @@ answers questions, writes files, or changes controller state.
 through Neovim. Missing web configuration, no active session, invalid web URL,
 and browser failures are actionable notifications. Browser-facing URLs must be
 credential-free HTTP(S) bases.
-Neovim 0.12 returns an asynchronous handler process. The plugin observes that
-handle with bounded timer polling and only zero-timeout `wait(0)` result probes;
-it never performs an unbounded wait on the interaction path. A closing handle
-whose result is not retained yet continues polling within a five-second bound.
+Neovim 0.12 returns an asynchronous `SystemObj` handler process. Its `wait()`
+method force-kills the process whenever a supplied timeout elapses, including a
+zero timeout, so the plugin never calls it. Instead, bounded timer polling reads
+the completion result retained by Neovim after process exit and inherited output
+pipes close. A handler whose result is not retained yet continues polling within
+a five-second bound without signalling or otherwise changing that process.
 The plugin reports terminal success only after a zero exit, and reports non-zero,
 signalled, or observation-timeout completion as `browser_open_failed`. A missing handler fails immediately; an overridden handler
 whose completion cannot be observed receives a warning and no success claim.

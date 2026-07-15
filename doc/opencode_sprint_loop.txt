@@ -54,12 +54,12 @@ untrusted name.
 
 COMMANDS                                                        *SprintLoop-commands*
 
-:SprintLoopStart        Detached `sprint-loop run` launch.
-:SprintLoopProgress     Show validated controller JSON in a centered float.
-:SprintLoopPause        Delegate `sprint-loop pause`.
-:SprintLoopResume       Delegate `sprint-loop resume` with a newly resolved URL.
-:SprintLoopStop         Delegate `sprint-loop stop`.
-:SprintLoopOpenSession  Open the active encoded OpenCode session route.
+:SprintLoopStart        Detached `sprint-loop run` launch.        *SprintLoopStart*
+:SprintLoopProgress     Show validated controller JSON.        *SprintLoopProgress*
+:SprintLoopPause        Delegate `sprint-loop pause`.              *SprintLoopPause*
+:SprintLoopResume       Delegate `sprint-loop resume`.            *SprintLoopResume*
+:SprintLoopStop         Delegate `sprint-loop stop`.                  *SprintLoopStop*
+:SprintLoopOpenSession  Open the active session route.      *SprintLoopOpenSession*
 
 The equivalent public methods are `start`, `progress`, `pause`, `resume`,
 `stop`, and `open_session`. They are asynchronous and intentionally do not
@@ -76,7 +76,10 @@ External stderr is not copied into notifications; non-zero exits and non-zero
 process signals use a generic diagnostic directing the user to progress.
 Detached `run` stdout/stderr use `/dev/null`, not Neovim-owned pipes. A zero
 process exit gets a distinct notice directing the user to progress and never
-claims that workflow state is terminal.
+claims that workflow state is terminal. The asynchronous `/dev/null` open and
+queued spawn are generation- and exit-gated. Setup replacement or |VimLeavePre|
+closes the pending descriptor without a stale spawn, watcher mutation, or launch
+notice; a controller that already spawned successfully is never signalled.
 
 WATCHER                                                         *SprintLoop-watcher*
 
@@ -135,8 +138,11 @@ Browser path prefixes accept RFC 3986 path characters and valid percent
 escapes; raw spaces, malformed escapes, backslashes, and invalid URL characters
 are rejected.
 Neovim 0.12 browser-handler completion is observed asynchronously with bounded
-timer polling and zero-timeout `wait(0)` probes only. A closing handle is polled
-until its retained result appears or the five-second observation bound expires.
+timer polling. `SystemObj:wait()` force-kills after any elapsed supplied timeout,
+including zero, so the plugin never calls it. It non-destructively reads the
+result Neovim retains after process exit and inherited output pipes close, until
+that result appears or the five-second observation bound expires. Timeout or
+observation cancellation never signals or otherwise changes the handler process.
 Zero exit is reported as success; non-zero, signalled, or timed-out completion
 reports `browser_open_failed`. Missing handlers fail immediately. Unobservable overridden
 handlers receive a warning and no terminal-success claim.

@@ -26,8 +26,10 @@ local function browser_result(code, signal, delay)
   local complete = delay == nil or delay == 0
   if delay and delay > 0 then vim.defer_fn(function() complete = true end, delay) end
   return {
-    is_closing = function() return complete end,
-    wait = function() return { code = code or 0, signal = signal or 0, stdout = "", stderr = "" } end,
+    result = function()
+      if not complete then return nil end
+      return { code = code or 0, signal = signal or 0, stdout = "", stderr = "" }
+    end,
   }
 end
 
@@ -725,12 +727,31 @@ end
 loop._test_reset()
 
 -- Status grammar, compatibility states, malformed categories, and complete rendering.
-for _, fixture in ipairs({
-  no_run(), persisted("validating", true, "running"), persisted("implementing", true, "waiting_for_user"),
-  persisted("paused", false), persisted("blocked", false), persisted("failed", false), persisted("stopped", false), persisted("finished", false),
-}) do
-  local decoded, err = status.decode(json(fixture))
-  check(decoded ~= nil and err == nil and #status.render(decoded) > 0, "supported status state validates and renders")
+local workflow_state_cases = {
+  { "initializing", true, nil, false },
+  { "validating", true, "running", false },
+  { "implementing", true, "waiting_for_user", false },
+  { "committing", true, nil, false },
+  { "pre_ci_auditing", true, "running", false },
+  { "pushing", true, nil, false },
+  { "waiting_for_ci", true, nil, false },
+  { "fixing_ci", true, "running", false },
+  { "final_auditing", true, "running", false },
+  { "paused", false, nil, false },
+  { "blocked", false, nil, true },
+  { "stopping", true, nil, false },
+  { "stopped", false, nil, true },
+  { "failed", false, nil, true },
+  { "finished", false, nil, false },
+}
+for _, case in ipairs(workflow_state_cases) do
+  local fixture = persisted(case[1], case[2], case[3])
+  local decoded_state, err = status.decode(json(fixture))
+  local rendered_state = decoded_state and table.concat(status.render(decoded_state), "\n") or ""
+  check(decoded_state ~= nil and err == nil, case[1] .. " state accepts its valid process/active/reason combination")
+  check(rendered_state:find("State: " .. case[1], 1, true) ~= nil, case[1] .. " state renders")
+  check((fixture.reason ~= null) == case[4], case[1] .. " fixture has the state-specific reason presence")
+  check((case[3] == nil) == (fixture.active.status == null), case[1] .. " fixture has the state-specific active invocation")
 end
 local decoded, decode_error = status.decode('{"a":1,"\\u0061":2}')
 check(decoded == nil and decode_error == "invalid_status_json", "escaped-equivalent duplicate keys reject")
@@ -980,24 +1001,21 @@ loop.open_session(); wait_for(function() return opened_target ~= nil end, "brows
 wait_for(function() return notification_count("opened active session") == 1 end, "asynchronous browser success is observed without blocking")
 local expected_root = vim.base64.encode(status_document.sprint_root):gsub("%+", "-"):gsub("/", "_"):gsub("=+$", "")
 check(opened_target == "https://example.test/prefix/" .. expected_root .. "/session/ses%2Fone%20two", "session route encodes canonical root and one path segment")
-local retained_attempts, retained_timeouts = 0, {}
+local retained_attempts, destructive_waits = 0, 0
 loop._test_set_browser(function()
   return {
-    is_closing = function() return true end,
-    wait = function(_, timeout)
+    result = function()
       retained_attempts = retained_attempts + 1
-      table.insert(retained_timeouts, timeout)
       if retained_attempts < 3 then return nil end
       return { code = 0, signal = 0, stdout = "", stderr = "" }
     end,
+    wait = function() destructive_waits = destructive_waits + 1; error("destructive wait must not be called") end,
   }
 end)
 clear_notifications(); loop.open_session()
 wait_for(function() return notification_count("opened active session") == 1 end, "closing browser handle is polled until its retained result is available")
 check(retained_attempts >= 3, "closing-before-result browser handle continues timer polling")
-local all_browser_waits_nonblocking = true
-for _, timeout in ipairs(retained_timeouts) do if timeout ~= 0 then all_browser_waits_nonblocking = false end end
-check(all_browser_waits_nonblocking, "browser result observation uses only wait(0)")
+check(destructive_waits == 0, "browser result observation never calls destructive wait")
 loop._test_set_browser(function() return nil, "no handler" end)
 clear_notifications(); loop.open_session(); wait_for(function() return notification_count("browser_open_failed") == 1 end, "nil,error browser return fails")
 loop._test_set_browser(function() error("synthetic browser failure") end)
@@ -1009,17 +1027,16 @@ clear_notifications(); loop.open_session(); wait_for(function() return notificat
 check(notification_count("opened active session") == 0, "unobservable browser handler never claims terminal success")
 loop._test_set_browser_observation_timeout(30)
 loop._test_set_browser(function()
-  return { is_closing = function() return false end, wait = function() error("wait must not run before close") end }
+  return { result = function() return nil end }
 end)
 clear_notifications(); loop.open_session()
 wait_for(function() return notification_count("browser_open_failed") == 1 end, "browser observation timeout is bounded")
 check(table_count(loop._test_state().openers) == 0, "timed-out browser observation closes its timer")
 loop._test_set_browser_observation_timeout(5000)
-local cancelled_browser_waits = 0
+local cancelled_browser_reads = 0
 loop._test_set_browser(function()
   return {
-    is_closing = function() return false end,
-    wait = function() cancelled_browser_waits = cancelled_browser_waits + 1 end,
+    result = function() cancelled_browser_reads = cancelled_browser_reads + 1; return nil end,
   }
 end)
 clear_notifications(); loop.open_session()
@@ -1027,7 +1044,7 @@ wait_for(function() return table_count(loop._test_state().openers) == 1 end, "pe
 loop.setup({ executable = "fake", sprint_root = "/tmp/reconfigured", server_url = "http://127.0.0.1" })
 check(table_count(loop._test_state().openers) == 0, "setup replacement cancels browser observation timer")
 vim.wait(100)
-check(cancelled_browser_waits == 0, "cancelled browser observation cannot call wait later")
+check(cancelled_browser_reads == 0, "cancelled browser observation cannot read completion later")
 for _, invalid in ipairs({
   "ftp://host", "http://", "http://user:synthetic-secret@host", "http://host?x=synthetic-secret", "http://host#synthetic-secret",
   "https://example.test/prefix/token=synthetic-secret", "https://example.test/prefix/glpat-" .. string.rep("A", 20),
@@ -1399,6 +1416,91 @@ vim.wait(30)
 check(#calls == 1, "exit-cancelled action cannot spawn a controller")
 loop._test_reset()
 
+-- Detached pre-spawn work is generation/exit gated through delayed fs_open.
+for _, replacement in ipairs({ "setup", "VimLeavePre" }) do
+  local pending_open, close_count, spawn_count, kill_count = nil, 0, 0, 0
+  clear_notifications(); loop._test_reset(); process.set_runner_for_test(nil)
+  loop.setup({ executable = vim.fn.getcwd() .. "/tests/fake-sprint-loop", sprint_root = "/tmp/pre-spawn", server_url = "http://127.0.0.1" })
+  wait_for(function() return loop._test_state().status_active == nil end, replacement .. " pre-spawn setup status completes")
+  process.set_detached_runtime_for_test({
+    fs_open = function(_, _, _, callback) pending_open = callback end,
+    fs_close = function(_, callback) close_count = close_count + 1; vim.schedule(callback) end,
+    spawn = function()
+      spawn_count = spawn_count + 1
+      return {
+        is_closing = function() return false end,
+        close = function() end,
+        unref = function() end,
+        kill = function() kill_count = kill_count + 1 end,
+      }, 1234
+    end,
+  })
+  loop.start()
+  wait_for(function() return pending_open ~= nil end, replacement .. " reaches delayed detached /dev/null open")
+  if replacement == "setup" then
+    loop.setup({ executable = vim.fn.getcwd() .. "/tests/fake-sprint-loop", sprint_root = "/tmp/replacement", server_url = "http://127.0.0.1" })
+  else
+    vim.api.nvim_exec_autocmds("VimLeavePre", {})
+  end
+  pending_open(nil, 71)
+  wait_for(function() return close_count == 1 end, replacement .. " closes the stale detached descriptor")
+  vim.wait(30)
+  check(spawn_count == 0, replacement .. " suppresses stale detached spawn after delayed fs_open")
+  check(kill_count == 0, replacement .. " never signals a controller process")
+  check(notification_count("controller launch requested") == 0 and not loop._test_state().watching, replacement .. " stale pre-spawn work cannot mutate watcher state or notify launch")
+  process.set_detached_runtime_for_test(nil)
+end
+
+-- The second gate covers replacement after fs_open but before scheduled spawn.
+do
+  local gate, close_count, spawn_count, completion_error = true, 0, 0, nil
+  process.set_detached_runtime_for_test({
+    fs_open = function(_, _, _, callback) callback(nil, 72) end,
+    fs_close = function(_, callback) close_count = close_count + 1; callback() end,
+    spawn = function() spawn_count = spawn_count + 1; return nil, "must not spawn" end,
+  })
+  process.run({ "synthetic-controller", "run" }, {
+    detach = true,
+    spawn_gate = function() return gate end,
+    on_spawn = function() error("stale scheduled spawn called on_spawn") end,
+  }, function(_, err) completion_error = err end)
+  gate = false
+  wait_for(function() return completion_error ~= nil end, "scheduled detached spawn observes its replacement gate")
+  check(completion_error == "process_spawn_cancelled" and spawn_count == 0 and close_count == 1, "scheduled stale spawn is suppressed and its descriptor is closed")
+  process.set_detached_runtime_for_test(nil)
+end
+
+-- Once spawn succeeds, later gate replacement does not target that controller.
+do
+  local gate, exit_callback = true, nil
+  local spawn_count, on_spawn_count, kill_count, completion_count = 0, 0, 0, 0
+  local fake_handle = {
+    closing = false,
+    is_closing = function(self) return self.closing end,
+    close = function(self) self.closing = true end,
+    unref = function() end,
+    kill = function() kill_count = kill_count + 1 end,
+  }
+  process.set_detached_runtime_for_test({
+    fs_open = function(_, _, _, callback) callback(nil, 73) end,
+    fs_close = function(_, callback) callback() end,
+    spawn = function(_, _, callback) spawn_count = spawn_count + 1; exit_callback = callback; return fake_handle, 1234 end,
+  })
+  process.run({ "synthetic-controller", "run" }, {
+    detach = true,
+    spawn_gate = function() return gate end,
+    on_spawn = function() on_spawn_count = on_spawn_count + 1 end,
+  }, function() completion_count = completion_count + 1 end)
+  wait_for(function() return spawn_count == 1 and on_spawn_count == 1 end, "successful detached spawn calls on_spawn exactly once")
+  gate = false
+  vim.wait(30)
+  check(kill_count == 0, "replacement after successful detached spawn does not signal the controller")
+  exit_callback(0, 0)
+  wait_for(function() return completion_count == 1 end, "successfully spawned detached process retains normal completion")
+  process.set_detached_runtime_for_test(nil)
+end
+loop._test_reset()
+
 -- The repository fake drives the production vim.system adapter and public actions.
 process.set_runner_for_test(nil)
 local fake = vim.fn.getcwd() .. "/tests/fake-sprint-loop"
@@ -1487,6 +1589,42 @@ loop._test_set_browser(function(target) return vim.ui.open(target, { cmd = { fak
 clear_notifications(); loop.open_session()
 wait_for(function() return notification_count("browser_open_failed") == 1 end, "Neovim 0.12 SystemObj browser non-zero exit is reported")
 
+local retained_pipe_handle
+loop._test_set_browser(function(target)
+  retained_pipe_handle = assert(vim.ui.open(target, { cmd = { fake, "browser-retained-pipes" } }))
+  return retained_pipe_handle
+end)
+clear_notifications(); loop.open_session()
+wait_for(function()
+  return retained_pipe_handle ~= nil and retained_pipe_handle:is_closing() and retained_pipe_handle._state.result == nil
+end, "real SystemObj exits while a descendant still retains its output pipes", 1000)
+wait_for(function() return notification_count("opened active session") == 1 end, "browser success waits non-destructively for descendant-retained pipes", 1500)
+check(retained_pipe_handle._state.result.code == 0 and retained_pipe_handle._state.result.signal == 0, "descendant-retained-pipe SystemObj keeps its successful result")
+
+local timed_out_browser_handle
+loop._test_set_browser_observation_timeout(30)
+loop._test_set_browser(function(target)
+  timed_out_browser_handle = assert(vim.ui.open(target, { cmd = { fake, "browser-delayed-success" } }))
+  return timed_out_browser_handle
+end)
+clear_notifications(); loop.open_session()
+wait_for(function() return notification_count("browser_open_failed") == 1 end, "real SystemObj observation timeout is bounded")
+wait_for(function() return timed_out_browser_handle._state.result ~= nil end, "timed-out browser process still completes independently", 1000)
+check(timed_out_browser_handle._state.result.code == 0 and timed_out_browser_handle._state.result.signal == 0, "browser observation timeout does not poison or signal the SystemObj")
+
+local cancelled_system_handle
+loop._test_set_browser_observation_timeout(5000)
+loop._test_set_browser(function(target)
+  cancelled_system_handle = assert(vim.ui.open(target, { cmd = { fake, "browser-delayed-success" } }))
+  return cancelled_system_handle
+end)
+clear_notifications(); loop.open_session()
+wait_for(function() return cancelled_system_handle ~= nil and table_count(loop._test_state().openers) == 1 end, "real SystemObj browser observation becomes cancellable")
+loop.setup({ executable = fake, sprint_root = "/tmp/browser-replacement", server_url = "http://127.0.0.1" })
+wait_for(function() return cancelled_system_handle._state.result ~= nil end, "cancelled browser process still completes independently", 1000)
+check(cancelled_system_handle._state.result.code == 0 and cancelled_system_handle._state.result.signal == 0, "setup cancellation does not poison or signal the SystemObj")
+check(notification_count("opened active session") == 0 and notification_count("browser_open_failed") == 0, "cancelled browser observer emits no stale completion notification")
+
 local production_ca = vim.fn.tempname()
 vim.fn.writefile({ "synthetic production CA" }, production_ca)
 vim.env.SPRINT_LOOP_FAKE_MODE = "ca-observation"
@@ -1551,13 +1689,26 @@ check(vim.fn.mkdir(help_smoke_doc, "p", 448) == 1, "manual-install help smoke cr
 local help_source = vim.fn.getcwd() .. "/doc/opencode_sprint_loop.txt"
 vim.fn.writefile(vim.fn.readfile(help_source), help_smoke_doc .. "/opencode_sprint_loop.txt")
 local helptags_ok = pcall(vim.cmd, "silent helptags " .. vim.fn.fnameescape(help_smoke_doc))
-local generated_tags = helptags_ok and table.concat(vim.fn.readfile(help_smoke_doc .. "/tags"), "\n") or ""
-check(helptags_ok and generated_tags:find("SprintLoop", 1, true) ~= nil, "manual-install helptags generation exposes SprintLoop help")
+local generated_tags = {}
+if helptags_ok then
+  for _, line in ipairs(vim.fn.readfile(help_smoke_doc .. "/tags")) do
+    local tag = line:match("^([^\t]+)\t")
+    if tag then generated_tags[tag] = true end
+  end
+end
+local help_text = table.concat(vim.fn.readfile(help_source), "\n")
+local local_references = {}
+for tag in help_text:gmatch("|(SprintLoop[^|]+)|") do local_references[tag] = true end
+for tag in pairs(local_references) do check(helptags_ok and generated_tags[tag] == true, "manual-install helptags resolves exact local reference " .. tag) end
+for _, tag in ipairs({ "SprintLoop", "SprintLoopStart", "SprintLoopProgress", "SprintLoopPause", "SprintLoopResume", "SprintLoopStop", "SprintLoopOpenSession" }) do
+  check(helptags_ok and generated_tags[tag] == true, "manual-install helptags generates exact tag " .. tag)
+end
 check(vim.fn.delete(help_smoke_root, "rf") == 0, "manual-install help smoke removes only its unique directory")
 vim.env.SPRINT_LOOP_FAKE_MODE = prior_fake_mode
 
 loop._test_reset()
 process.set_runner_for_test(nil)
+process.set_detached_runtime_for_test(nil)
 config.RESOLVER_TIMEOUT_MS = production_resolver_timeout
 vim.notify = original_notify
 io.stdout:write(string.format("Plugin tests: %d assertions, %d failures\n", tests, failures))

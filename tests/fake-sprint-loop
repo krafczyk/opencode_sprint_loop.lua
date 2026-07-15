@@ -70,6 +70,18 @@ case "${1:-}" in
   browser-fail)
     exit 7
     ;;
+  browser-delayed-success)
+    sleep 0.15
+    exit 0
+    ;;
+  browser-retained-pipes)
+    python3 -c 'import os, time
+pid = os.fork()
+if pid == 0:
+    time.sleep(0.25)
+    os._exit(0)
+os._exit(0)'
+    ;;
   pause|resume|stop)
     printf '%s\n' feature_not_implemented
     ;;

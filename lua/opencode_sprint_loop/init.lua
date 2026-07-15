@@ -302,7 +302,9 @@ local function controller_action(name)
           process.run(argv, {
             detach = name == "run",
             env = environment,
+            spawn_gate = function() return current(generation) end,
             on_spawn = function()
+              if not current(generation) then return end
               if name == "run" or name == "resume" then
                 cancel_observation_work()
                 launch_watcher_id = start_watcher(root, generation)
@@ -414,7 +416,17 @@ function M.open_session()
         local opener = browser_override or vim.ui.open
         local ok, handle, open_error = pcall(opener, target)
         if not ok or handle == nil or open_error ~= nil then notify("browser_open_failed"); return end
-        if type(handle.is_closing) ~= "function" or type(handle.wait) ~= "function" then
+        local result_reader
+        if type(handle) == "table" and type(handle.result) == "function" then
+          result_reader = function() return handle:result() end
+        elseif type(handle) == "table" and type(rawget(handle, "_state")) == "table" then
+          -- Neovim 0.12's vim.ui.open() returns a SystemObj. SystemObj:wait()
+          -- kills on every elapsed timeout, including wait(0), while the
+          -- completed result is retained non-destructively in its state after
+          -- process exit and all inherited output pipes close.
+          result_reader = function() return rawget(handle, "_state").result end
+        end
+        if not result_reader then
           notify("browser launch requested; handler completion unavailable", vim.log.levels.WARN)
           return
         end
@@ -429,16 +441,11 @@ function M.open_session()
           if not current(generation) then close(); return end
           local elapsed_ms = (vim.uv.hrtime() - observation_started) / 1000000
           if elapsed_ms >= BROWSER_OBSERVATION_TIMEOUT_MS then close(); notify("browser_open_failed"); return end
-          local observed, closing = pcall(handle.is_closing, handle)
+          local observed, result = pcall(result_reader)
           if not observed then close(); notify("browser_open_failed"); return end
-          if not closing then return end
-          -- A SystemObj handle can start closing before its retained result is
-          -- available. Poll with a zero timeout and keep the timer alive until
-          -- the result arrives or the observation bound expires.
-          local waited, result = pcall(handle.wait, handle, 0)
-          if waited and result == nil then return end
+          if result == nil then return end
           close()
-          if not waited or type(result) ~= "table" or result.code ~= 0 or (type(result.signal) == "number" and result.signal ~= 0) then
+          if type(result) ~= "table" or result.code ~= 0 or (type(result.signal) == "number" and result.signal ~= 0) then
             notify("browser_open_failed")
           else
             notify("opened active session", vim.log.levels.INFO)
