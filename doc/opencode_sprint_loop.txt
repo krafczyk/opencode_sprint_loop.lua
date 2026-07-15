@@ -1,0 +1,75 @@
+*opencode_sprint_loop.txt*  Thin Sprint Loop controller client
+
+=============================================================================
+CONTENTS                                                         *SprintLoop*
+
+This plugin requires Neovim 0.12 and an installed |sprint-loop| executable.
+Call `require("opencode_sprint_loop").setup()` before any action. It is a
+launcher/status client only: it does not start OpenCode, own workflow state,
+read controller files, inspect Git, or answer questions.
+
+SETUP                                                            *SprintLoop-setup*
+
+>lua
+  require("opencode_sprint_loop").setup({
+    sprint_root = function() return vim.fn.getcwd() end,
+    server_url = function(done) return "http://127.0.0.1:4096" end,
+    executable = "sprint-loop",
+    web_url = "http://127.0.0.1:4096",
+  })
+<
+
+`sprint_root` and `server_url` are required. All fields accept a string or a
+resolver. Resolvers run at action time. They may return a string or call
+`done(value, error)` exactly once; callback resolution times out after five
+seconds. `executable` defaults to `sprint-loop`. `web_url` is used only by
+|SprintLoopOpenSession|. `server_ca_cert`, when supplied, resolves to an absolute readable regular file
+passed only as SSL_CERT_FILE to `run` and `resume`; browser CA trust is separate.
+
+COMMANDS                                                        *SprintLoop-commands*
+
+:SprintLoopStart        Detached `sprint-loop run` launch.
+:SprintLoopProgress     Show validated controller JSON in a centered float.
+:SprintLoopPause        Delegate `sprint-loop pause`.
+:SprintLoopResume       Delegate `sprint-loop resume` with a newly resolved URL.
+:SprintLoopStop         Delegate `sprint-loop stop`.
+:SprintLoopOpenSession  Open the active encoded OpenCode session route.
+
+The equivalent public methods are `start`, `progress`, `pause`, `resume`,
+`stop`, and `open_session`. They are asynchronous and intentionally do not
+return a stable process/status/workflow result. The progress window is
+read-only; buffer-local `q` and `Esc` close it.
+
+WATCHER                                                         *SprintLoop-watcher*
+
+Setup and successful start/resume begin a single two-second, non-overlapping
+status watcher. A future `waiting_for_user` projection produces one notification
+per request ID directing the user to |SprintLoopOpenSession|. It does not expose
+question content or submit an answer. Sprint 2's probe is non-interactive;
+waiting is a controlled-fixture compatibility demonstration until Sprint 4.
+
+SECURITY                                                        *SprintLoop-security*
+
+Arguments are direct arrays, never shell strings. URLs must be credential-free.
+The plugin retains no persistent status/configuration, does not copy complete
+environments or CA contents, and uses status JSON as its sole workflow source.
+For mkchad, write a configuration callback that reads the existing URL only;
+never call a server `ensure`/start function. Do not test against the live
+~/.config/mkchad checkout. Use a disposable clone with isolated XDG roots.
+
+CONTROLS                                                        *SprintLoop-controls*
+
+The current Sprint 2 controller responds `feature_not_implemented` for pause,
+resume, and stop. The plugin displays that controller response and makes no
+local state transition. Recovery behavior is not implemented here.
+
+ERRORS                                                          *SprintLoop-errors*
+
+Expected failures are reported as concise notifications, including
+`setup_required`, `invalid_setup`, `resolver_failed`,
+`invalid_resolved_value`, `invalid_server_ca_cert`,
+`process_spawn_failed`, `controller_command_failed`,
+`status_output_too_large`, `invalid_status_json`,
+`unsupported_status_schema`, `inconsistent_status`, `web_url_unavailable`,
+`invalid_web_url`, `active_session_unavailable`, `browser_open_failed`, and
+`unsupported_neovim`.
