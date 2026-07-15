@@ -5,8 +5,9 @@ function M.show(lines)
   if M.window and vim.api.nvim_win_is_valid(M.window) then vim.api.nvim_win_close(M.window, true) end
   if M.buffer and vim.api.nvim_buf_is_valid(M.buffer) then vim.api.nvim_buf_delete(M.buffer, { force = true }) end
   local columns, rows = vim.o.columns, vim.o.lines
-  local width = math.max(20, math.min(columns - 2, math.max(20, math.floor(columns * 0.75))))
-  local height = math.max(3, math.min(rows - 2, math.max(3, math.min(#lines + 2, math.floor(rows * 0.75)))))
+  local available_width, available_height = math.max(1, columns - 2), math.max(1, rows - 2)
+  local width = math.min(available_width, math.max(1, math.floor(columns * 0.75)))
+  local height = math.min(available_height, math.max(1, math.min(#lines + 2, math.floor(rows * 0.75))))
   local buffer = vim.api.nvim_create_buf(false, true)
   vim.bo[buffer].buftype = "nofile"; vim.bo[buffer].bufhidden = "wipe"; vim.bo[buffer].swapfile = false
   vim.bo[buffer].modifiable = true

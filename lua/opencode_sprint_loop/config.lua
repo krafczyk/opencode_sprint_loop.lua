@@ -60,13 +60,13 @@ function M.resolve(value, generation, current, callback)
     return
   end
   local completed = false
-  local timed_out = false
+  local resolver_returned = false
+  local callback_count = 0
+  local callback_result, callback_error
+  local return_value
   local timer = vim.uv.new_timer()
   local function finish(result, error)
-    if completed then
-      if current(generation) then callback(nil, "resolver_failed: resolver completed more than once") end
-      return
-    end
+    if completed then return end
     completed = true
     if timer and not timer:is_closing() then timer:stop(); timer:close() end
     if not current(generation) then return end
@@ -74,22 +74,36 @@ function M.resolve(value, generation, current, callback)
     elseif not valid_resolved(result) then callback(nil, "invalid_resolved_value")
     else callback(result, nil) end
   end
-  timer:start(M.RESOLVER_TIMEOUT_MS, 0, vim.schedule_wrap(function()
-    timed_out = true
-    finish(nil, "timeout")
-  end))
-  local ok, returned = xpcall(function() return value(function(result, error) finish(result, error) end) end, debug.traceback)
+  local settle_scheduled = false
+  local function settle()
+    if completed or not resolver_returned or settle_scheduled then return end
+    settle_scheduled = true
+    vim.schedule(function()
+      settle_scheduled = false
+      if completed then return end
+      if callback_count > 1 or (callback_count > 0 and return_value ~= nil) then
+        finish(nil, "duplicate completion")
+      elseif return_value ~= nil then
+        finish(return_value, nil)
+      elseif callback_count == 1 then
+        finish(callback_result, callback_error)
+      end
+    end)
+  end
+  timer:start(M.RESOLVER_TIMEOUT_MS, 0, vim.schedule_wrap(function() finish(nil, "timeout") end))
+  local ok, returned = xpcall(function()
+    return value(function(result, error)
+      if completed then return end
+      callback_count = callback_count + 1
+      if callback_count == 1 then callback_result, callback_error = result, error end
+      settle()
+    end)
+  end, debug.traceback)
+  resolver_returned = true
+  return_value = returned
   if not ok then
     finish(nil, "exception")
-  elseif returned ~= nil then
-    if completed then
-      finish(nil, "dual completion")
-    elseif timed_out then
-      return
-    else
-      finish(returned, nil)
-    end
-  end
+  else settle() end
 end
 
 function M.valid_ca_path(path)

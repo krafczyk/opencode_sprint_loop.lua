@@ -20,8 +20,33 @@ local function positive_integer(value)
   return type(value) == "number" and value % 1 == 0 and value > 0
 end
 
+local function valid_utf8(document)
+  local index = 1
+  while index <= #document do
+    local first = document:byte(index)
+    if first < 0x80 then
+      index = index + 1
+    else
+      local count, minimum
+      if first >= 0xC2 and first <= 0xDF then count, minimum = 1, 0x80
+      elseif first >= 0xE0 and first <= 0xEF then count, minimum = 2, 0x800
+      elseif first >= 0xF0 and first <= 0xF4 then count, minimum = 3, 0x10000
+      else return false end
+      local codepoint = first % (2 ^ (6 - count))
+      for offset = 1, count do
+        local byte = document:byte(index + offset)
+        if not byte or byte < 0x80 or byte > 0xBF then return false end
+        codepoint = codepoint * 64 + (byte - 0x80)
+      end
+      if codepoint < minimum or codepoint > 0x10FFFF or (codepoint >= 0xD800 and codepoint <= 0xDFFF) then return false end
+      index = index + count + 1
+    end
+  end
+  return true
+end
+
 -- vim.json.decode accepts duplicate object keys. This compact grammar walk rejects
--- them before decoding, while also rejecting trailing values and non-JSON numbers.
+-- semantically duplicate keys before decoding, trailing values, and non-finite numbers.
 local function no_duplicate_keys(document)
   local position, length = 1, #document
   local function whitespace()
@@ -36,7 +61,9 @@ local function no_duplicate_keys(document)
       local character = document:sub(position, position)
       if character == '"' then
         position = position + 1
-        return document:sub(start, position - 1)
+        local ok, decoded = pcall(vim.json.decode, document:sub(start, position - 1))
+        if not ok or type(decoded) ~= "string" then error("invalid string") end
+        return decoded
       elseif character == "\\" then
         position = position + 1
         local escape = document:sub(position, position)
@@ -78,11 +105,36 @@ local function no_duplicate_keys(document)
   end
   value = function()
     whitespace(); local character = document:sub(position, position)
-    if character == "{" then object() elseif character == "[" then array() elseif character == '"' then string_value()
+    if character == "{" then object()
+    elseif character == "[" then array()
+    elseif character == '"' then string_value()
+    elseif character == "t" and document:sub(position, position + 3) == "true" then position = position + 4
+    elseif character == "f" and document:sub(position, position + 4) == "false" then position = position + 5
+    elseif character == "n" and document:sub(position, position + 3) == "null" then position = position + 4
     else
-      local token = document:sub(position):match("^[-0-9%.eE]+") or document:sub(position):match("^[a-z]+")
-      if not token or (tonumber(token) == nil and token ~= "true" and token ~= "false" and token ~= "null") then error("invalid value") end
-      position = position + #token
+      local start = position
+      if character == "-" then position = position + 1; character = document:sub(position, position) end
+      if character == "0" then
+        position = position + 1
+        if document:sub(position, position):match("%d") then error("leading zero") end
+      elseif character:match("[1-9]") then
+        repeat position = position + 1 until not document:sub(position, position):match("%d")
+      else error("invalid number") end
+      if document:sub(position, position) == "." then
+        position = position + 1
+        if not document:sub(position, position):match("%d") then error("invalid fraction") end
+        repeat position = position + 1 until not document:sub(position, position):match("%d")
+      end
+      local exponent = document:sub(position, position)
+      if exponent == "e" or exponent == "E" then
+        position = position + 1
+        local sign = document:sub(position, position)
+        if sign == "+" or sign == "-" then position = position + 1 end
+        if not document:sub(position, position):match("%d") then error("invalid exponent") end
+        repeat position = position + 1 until not document:sub(position, position):match("%d")
+      end
+      local number = tonumber(document:sub(start, position - 1))
+      if not number or number ~= number or number == math.huge or number == -math.huge then error("non-finite number") end
     end
   end
   local ok = pcall(function() value(); whitespace(); if position <= length then error("trailing data") end end)
@@ -98,7 +150,7 @@ end
 local function validate_active(active, running)
   if type(active) ~= "table" or not fields(active, { "role", "invocation_id", "session_id", "status", "interaction" }) then return false end
   if is_null(active.status) then return is_null(active.role) and is_null(active.invocation_id) and is_null(active.session_id) and is_null(active.interaction) end
-  if active.status == "running" then return bounded_string(active.role) and bounded_string(active.invocation_id) and bounded_string(active.session_id) and is_null(active.interaction) end
+  if active.status == "running" then return running and bounded_string(active.role) and bounded_string(active.invocation_id) and bounded_string(active.session_id) and is_null(active.interaction) end
   if active.status ~= "waiting_for_user" or not running then return false end
   local interaction = active.interaction
   return bounded_string(active.role) and bounded_string(active.invocation_id) and bounded_string(active.session_id)
@@ -133,7 +185,7 @@ end
 function M.decode(output)
   if type(output) ~= "string" or output == "" then return nil, "invalid_status_json" end
   if #output > M.MAX_STATUS_BYTES then return nil, "status_output_too_large" end
-  if not no_duplicate_keys(output) then return nil, "invalid_status_json" end
+  if not valid_utf8(output) or not no_duplicate_keys(output) then return nil, "invalid_status_json" end
   local ok, status = pcall(vim.json.decode, output)
   if not ok or type(status) ~= "table" then return nil, "invalid_status_json" end
   if not fields(status, required) then return nil, "inconsistent_status" end
@@ -171,6 +223,9 @@ function M.render(status)
     table.insert(lines, "Active: " .. M.display(active.role) .. " " .. M.display(active.invocation_id) .. " (" .. M.display(active.session_id) .. ")")
     table.insert(lines, "Active status: " .. M.display(active.status))
     if not is_null(active.interaction) then table.insert(lines, "WAITING FOR USER: question " .. active.interaction.question_count .. " at " .. M.display(active.interaction.asked_at)) end
+  else
+    table.insert(lines, "Active: - - (-)")
+    table.insert(lines, "Active status: -")
   end
   for _, kind in ipairs({ "local", "pushed" }) do
     local pairs_list = {}
@@ -180,11 +235,12 @@ function M.render(status)
     for _, item in ipairs(pairs_list) do table.insert(rendered, item[1] .. "=" .. M.display(item[2])) end
     table.insert(lines, "Commits " .. kind .. ": " .. table.concat(rendered, ", "))
   end
-  table.insert(lines, "Audit: " .. M.display(status.audit.phase) .. " round " .. tostring(status.audit.pre_ci_round) .. "/" .. tostring(status.audit.pre_ci_max_rounds))
-  table.insert(lines, "CI: " .. M.display(status.ci.status) .. " attempt " .. tostring(status.ci.attempt))
+  table.insert(lines, "Audit: " .. M.display(status.audit.phase) .. " round " .. tostring(status.audit.pre_ci_round) .. "/" .. tostring(status.audit.pre_ci_max_rounds) .. ", remaining effort " .. M.display(status.audit.remaining_effort))
+  table.insert(lines, "CI: " .. M.display(status.ci.status) .. " attempt " .. tostring(status.ci.attempt) .. ", commit " .. M.display(status.ci.commit_sha))
   table.insert(lines, "Counters: implementations " .. status.counters.implementation_cycles .. ", CI fixes " .. status.counters.ci_fix_attempts)
-  table.insert(lines, "Checklist: " .. status.checklist.satisfied .. " satisfied, " .. status.checklist.partial .. " partial, " .. status.checklist.unsatisfied .. " unsatisfied")
-  if not is_null(status.last_event) then table.insert(lines, "Last event: " .. M.display(status.last_event.type) .. " at " .. M.display(status.last_event.timestamp)) end
+  table.insert(lines, "Checklist: " .. status.checklist.satisfied .. " satisfied, " .. status.checklist.partial .. " partial, " .. status.checklist.unsatisfied .. " unsatisfied, " .. status.checklist.not_evaluated .. " not evaluated; assessed " .. M.display(status.checklist.assessed_at))
+  if not is_null(status.last_event) then table.insert(lines, "Last event: #" .. status.last_event.sequence .. " " .. M.display(status.last_event.type) .. " at " .. M.display(status.last_event.timestamp))
+  else table.insert(lines, "Last event: -") end
   table.insert(lines, "Controller: " .. M.display(status.controller_version) .. "    Updated: " .. M.display(status.updated_at))
   return lines
 end

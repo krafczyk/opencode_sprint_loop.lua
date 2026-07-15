@@ -23,11 +23,39 @@ they may synchronously return a string or call `done(value, error)` once. A
 callback resolver has a five-second bound. The required `sprint_root` and
 `server_url` are not discovered or guessed.
 
+All six commands are registered when the plugin loads, so invoking one before
+successful setup reports `setup_required` instead of an unknown command. A
+later `setup()` replaces the active configuration and watcher, but pending
+question IDs remain deduplicated for the lifetime of that Neovim process.
+
 The generic plugin has no mkchad dependency or hard-coded mkchad API. A mkchad
 adapter may read an existing URL through a user-supplied callback such as
 `vim.g.opencode_opts.server.url(done)`, but it must never call `ensure` or any
 server-start operation. Do not develop against `~/.config/mkchad`: use a
 disposable remote clone and isolated XDG roots for any integration exercise.
+
+For the currently documented mkchad callback/CA shape, keep the adapter in user
+configuration:
+
+```lua
+local function existing_mkchad_url(done)
+  local server = vim.g.opencode_opts and vim.g.opencode_opts.server
+  if not server or type(server.url) ~= "function" then
+    done(nil, "mkchad OpenCode URL resolver is unavailable")
+    return
+  end
+  server.url(done) -- read only; never call server.ensure()
+end
+
+require("opencode_sprint_loop").setup({
+  sprint_root = function() return vim.fn.getcwd() end,
+  server_url = existing_mkchad_url,
+  web_url = existing_mkchad_url,
+  server_ca_cert = function()
+    return vim.g.opencode_opts.server.ca_cert()
+  end,
+})
+```
 
 When the optional `server_ca_cert` resolver is configured, it must resolve to
 an absolute readable regular file. Its path is supplied only as `SSL_CERT_FILE` to `run` and `resume` child
@@ -52,16 +80,21 @@ not proof that the controller survived; use progress to confirm later
 `process_running` status. Controls delegate to the current controller. In the
 Sprint 2-compatible controller, pause, resume, and stop accurately report
 `feature_not_implemented`; the plugin does not simulate a state change.
+Before start or resume constructs argv, it requires `server_url` to be a
+credential-free HTTP(S) origin. User-info, paths, queries, fragments, malformed
+authorities, and other schemes are rejected without echoing the value.
 
 Progress calls `status --json` asynchronously and opens a disposable centered,
 read-only float. `q` and `Esc` close that buffer. It displays no-run, state,
-safe reason, active session, commits, audit/CI/counters/checklist, and last
-event. Server URLs, credentials, prompts, transcripts, and question text are
-never displayed.
+safe reason, active session, commits, audit remaining effort, CI commit SHA,
+counters, all checklist counts and assessment time, and the last event sequence
+and time. Nullable evidence is rendered explicitly as `-`. Server URLs,
+credentials, prompts, transcripts, and question text are never displayed.
 
 After setup and start/resume, one ephemeral watcher polls at a bounded
 two-second interval with at most one status process in flight. It stops after
-an observed controller exits and emits one notification per pending request ID
+an observed controller exits (including a final launch-completion observation)
+and emits one notification per pending request ID
 for future-compatible `waiting_for_user` status. It never reads question text,
 answers questions, writes files, or changes controller state.
 
@@ -71,6 +104,12 @@ through Neovim. Missing web configuration, no active session, invalid web URL,
 and browser failures are actionable notifications. Browser-facing URLs must be
 credential-free HTTP(S) bases.
 
+The plugin requires the complete schema-version-one status projection described
+for Sprint 3. Unsupported schemas or missing/inconsistent fields fail closed;
+upgrade the plugin and controller together if their status contracts differ.
+Desktop notifications and browser opening still depend on the operator's
+Neovim UI and system URL handler.
+
 ## Verification
 
 Default tests use a fake controller process and no network, browser, OpenCode,
@@ -79,6 +118,12 @@ GitHub, model, or credentials:
 ```bash
 nvim --headless --noplugin -u tests/minimal_init.lua -l tests/run.lua
 ```
+
+The suite covers the setup/API, argv, streaming output bounds, complete status
+matrix, float lifecycle, watcher lifecycle, URL/browser behavior, and CA child
+environment. It also launches the repository fake executable from a nested
+headless Neovim and proves that the detached child records completion after the
+launcher exits.
 
 A real-server/mkchad demonstration is opt-in and is not performed by this
 suite. Sprint 3 supports presentation of a fixture-only waiting status; real

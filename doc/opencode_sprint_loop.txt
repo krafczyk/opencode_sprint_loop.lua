@@ -25,6 +25,9 @@ resolver. Resolvers run at action time. They may return a string or call
 seconds. `executable` defaults to `sprint-loop`. `web_url` is used only by
 |SprintLoopOpenSession|. `server_ca_cert`, when supplied, resolves to an absolute readable regular file
 passed only as SSL_CERT_FILE to `run` and `resume`; browser CA trust is separate.
+Commands are registered at plugin load. Before successful setup they report
+`setup_required`; repeated setup replaces configuration and watcher state while
+preserving pending-request notification deduplication for this Neovim process.
 
 COMMANDS                                                        *SprintLoop-commands*
 
@@ -40,6 +43,11 @@ The equivalent public methods are `start`, `progress`, `pause`, `resume`,
 return a stable process/status/workflow result. The progress window is
 read-only; buffer-local `q` and `Esc` close it.
 
+Before `run` or `resume` argv is constructed, `server_url` must be a
+credential-free HTTP(S) origin. Malformed authorities, user-info, paths,
+queries, fragments, and unsupported schemes are rejected without echoing the
+value. Process stdout and stderr are bounded during asynchronous streaming.
+
 WATCHER                                                         *SprintLoop-watcher*
 
 Setup and successful start/resume begin a single two-second, non-overlapping
@@ -47,6 +55,14 @@ status watcher. A future `waiting_for_user` projection produces one notification
 per request ID directing the user to |SprintLoopOpenSession|. It does not expose
 question content or submit an answer. Sprint 2's probe is non-interactive;
 waiting is a controlled-fixture compatibility demonstration until Sprint 4.
+The watcher performs a final status observation when a launched controller
+exits before active state is observed and closes its timer when observation ends.
+
+PROGRESS                                                        *SprintLoop-progress*
+
+The float includes audit remaining effort, CI commit SHA, all checklist counts
+including `not_evaluated`, checklist assessment time, and the last event
+sequence. Relevant null evidence is shown as `-` rather than omitted.
 
 SECURITY                                                        *SprintLoop-security*
 
@@ -56,6 +72,9 @@ environments or CA contents, and uses status JSON as its sole workflow source.
 For mkchad, write a configuration callback that reads the existing URL only;
 never call a server `ensure`/start function. Do not test against the live
 ~/.config/mkchad checkout. Use a disposable clone with isolated XDG roots.
+The current adapter shape is `vim.g.opencode_opts.server.url(done)` for the
+existing URL and `vim.g.opencode_opts.server.ca_cert()` for the CA path; these
+belong in user setup and are not hard-coded by the plugin.
 
 CONTROLS                                                        *SprintLoop-controls*
 
@@ -73,3 +92,8 @@ Expected failures are reported as concise notifications, including
 `unsupported_status_schema`, `inconsistent_status`, `web_url_unavailable`,
 `invalid_web_url`, `active_session_unavailable`, `browser_open_failed`, and
 `unsupported_neovim`.
+
+The client requires the complete Sprint 3 schema-version-one status projection.
+An unsupported or inconsistent projection fails closed; update controller and
+plugin together when their compatibility contracts differ. Desktop notification
+and URL-handler availability remain properties of the operator environment.
