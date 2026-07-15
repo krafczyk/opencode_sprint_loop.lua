@@ -50,29 +50,47 @@ end
 ---@param generation number
 ---@param current fun(): boolean
 ---@param callback fun(string|nil, string|nil)
+---@return table handle cancellable resolver-lifetime handle
 function M.resolve(value, generation, current, callback)
+  local completed, cancelled = false, false
+  local timer = nil
+  local handle = {}
+  local function close_timer()
+    if timer and not timer:is_closing() then timer:stop(); timer:close() end
+    timer = nil
+  end
+  function handle.cancel()
+    if completed or cancelled then return end
+    cancelled = true
+    close_timer()
+  end
+  function handle.is_active()
+    return not completed and not cancelled
+  end
   if type(value) == "string" then
     vim.schedule(function()
-      if current(generation) then
+      if not cancelled and current(generation) then
+        completed = true
         if valid_resolved(value) then callback(value, nil) else callback(nil, "invalid_resolved_value") end
       end
     end)
-    return
+    return handle
   end
-  local completed = false
   local resolver_returned = false
   local callback_count = 0
   local callback_result, callback_error
   local return_value
-  local timer = vim.uv.new_timer()
+  timer = vim.uv.new_timer()
   local function finish(result, error)
-    if completed then return end
+    if completed or cancelled then return end
     completed = true
-    if timer and not timer:is_closing() then timer:stop(); timer:close() end
-    if not current(generation) then return end
-    if error ~= nil then callback(nil, "resolver_failed")
-    elseif not valid_resolved(result) then callback(nil, "invalid_resolved_value")
-    else callback(result, nil) end
+    close_timer()
+    vim.schedule(function()
+      if cancelled or not current(generation) then return end
+      if error ~= nil then callback(nil, "resolver_failed")
+      elseif not valid_resolved(result) then callback(nil, "invalid_resolved_value")
+      else callback(result, nil) end
+    end)
   end
   local function arbitrate()
     if completed or not resolver_returned then return end
@@ -107,6 +125,7 @@ function M.resolve(value, generation, current, callback)
   elseif callback_count > 1 or (callback_count > 0 and return_value ~= nil) then
     finish(nil, "duplicate completion")
   end
+  return handle
 end
 
 function M.valid_ca_path(path)

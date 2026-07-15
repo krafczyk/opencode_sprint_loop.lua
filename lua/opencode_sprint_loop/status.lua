@@ -7,9 +7,62 @@ local required = {
   "last_event", "updated_at",
 }
 
+local workflow_states = {
+  initializing = true, validating = true, implementing = true, committing = true,
+  pre_ci_auditing = true, pushing = true, waiting_for_ci = true, fixing_ci = true,
+  final_auditing = true, paused = true, blocked = true, stopping = true,
+  stopped = true, failed = true, finished = true,
+}
+local terminal_states = { stopped = true, failed = true, finished = true }
+
+local function contains_credential(value)
+  local lower = value:lower()
+  if lower:find("authorization%s*:%s*basic%s+%S+")
+    or lower:find("authorization%s*:%s*bearer%s+%S+")
+    or lower:find("proxy%-authorization%s*:%s*basic%s+%S+")
+    or lower:find("proxy%-authorization%s*:%s*bearer%s+%S+")
+    or value:find("-----BEGIN [A-Z ]*PRIVATE KEY-----") then return true end
+
+  for uri in value:gmatch("[%a][%w+%.%-]*://%S+") do
+    local authority = uri:match("^[%a][%w+%.%-]*://([^/%?#]*)")
+    if (authority and authority:find("@", 1, true)) or uri:find("?", 1, true) or uri:find("#", 1, true) then return true end
+  end
+
+  local names = {
+    "access_token", "access-token", "api_key", "api-key", "apikey", "authorization",
+    "credential", "password", "secret", "token",
+  }
+  for _, name in ipairs(names) do
+    if lower:find("[?&#]" .. name .. "=[^&#%s]+")
+      or lower:find("%f[%w]" .. name .. "%f[^%w_-]%s*[=:]%s*%S+") then return true end
+  end
+
+  local provider_prefixes = {
+    { "ghs_", 36 }, { "gho_", 36 }, { "ghp_", 36 }, { "ghu_", 36 }, { "ghr_", 36 },
+    { "github_pat_", 20 }, { "glpat-", 20 }, { "glcbt-", 20 }, { "glptt-", 20 },
+    { "glrt-", 20 }, { "glimt-", 20 }, { "glsoat-", 20 }, { "gldt-", 20 },
+    { "glrtr-", 20 }, { "glft-", 20 }, { "glagent-", 20 }, { "glwt-", 20 },
+    { "glffct-", 20 }, { "gloas-", 20 }, { "sk-", 20 }, { "hf_", 20 },
+    { "xoxb-", 20 }, { "xoxa-", 20 }, { "xoxp-", 20 }, { "xoxr-", 20 },
+    { "xoxs-", 20 }, { "xapp-", 20 }, { "xwfp-", 20 }, { "aiza", 30 },
+    { "akia", 16 }, { "asia", 16 },
+  }
+  for _, item in ipairs(provider_prefixes) do
+    local start = 1
+    while true do
+      local first, last = lower:find(item[1], start, true)
+      if not first then break end
+      local suffix = value:sub(last + 1):match("^([A-Za-z0-9._-]+)") or ""
+      if #suffix >= item[2] then return true end
+      start = last + 1
+    end
+  end
+  return false
+end
+
 local function bounded_string(value)
   return type(value) == "string" and value ~= "" and #value <= M.MAX_DISPLAY_BYTES
-    and not value:find("[%z\1-\31\127]")
+    and not value:find("[%z\1-\31\127]") and not contains_credential(value)
 end
 
 local function is_null(value)
@@ -168,22 +221,35 @@ local function nullable_string(value)
   return is_null(value) or bounded_string(value)
 end
 
+local function object_table(value)
+  return type(value) == "table" and not vim.islist(value)
+end
+
 local function validate_run_fields(status)
-  if not fields(status.commits, { "local", "pushed" }) or type(status.commits["local"]) ~= "table" or type(status.commits.pushed) ~= "table" then return false end
-  for _, map in ipairs({ status.commits["local"], status.commits.pushed }) do
-    for key, value in pairs(map) do if not bounded_string(key) or not nullable_string(value) then return false end end
+  if not fields(status.commits, { "local", "pushed" }) or not object_table(status.commits["local"]) or not object_table(status.commits.pushed) then return false end
+  local repository_keys, local_count, pushed_count = {}, 0, 0
+  for key, value in pairs(status.commits["local"]) do
+    if not bounded_string(key) or not nullable_string(value) then return false end
+    repository_keys[key], local_count = true, local_count + 1
   end
+  if local_count == 0 then return false end
+  for key, value in pairs(status.commits.pushed) do
+    if not repository_keys[key] or not nullable_string(value) then return false end
+    pushed_count = pushed_count + 1
+  end
+  if pushed_count ~= local_count then return false end
   if not fields(status.audit, { "phase", "pre_ci_round", "pre_ci_max_rounds", "remaining_effort" })
     or not nullable_string(status.audit.phase) or not nonnegative_integer(status.audit.pre_ci_round) or not positive_integer(status.audit.pre_ci_max_rounds) or not nullable_string(status.audit.remaining_effort) then return false end
   if not fields(status.ci, { "status", "attempt", "commit_sha" }) or not bounded_string(status.ci.status) or not nonnegative_integer(status.ci.attempt) or not nullable_string(status.ci.commit_sha) then return false end
   if not fields(status.counters, { "implementation_cycles", "ci_fix_attempts" }) or not nonnegative_integer(status.counters.implementation_cycles) or not nonnegative_integer(status.counters.ci_fix_attempts) then return false end
   if not fields(status.checklist, { "satisfied", "partial", "unsatisfied", "not_evaluated", "assessed_at" }) then return false end
   for _, key in ipairs({ "satisfied", "partial", "unsatisfied", "not_evaluated" }) do if not nonnegative_integer(status.checklist[key]) then return false end end
-  if not nullable_string(status.checklist.assessed_at) or not nullable_string(status.updated_at) then return false end
+  if not nullable_string(status.checklist.assessed_at) or not bounded_string(status.updated_at) then return false end
   local reason_required = status.state == "blocked" or status.state == "failed" or status.state == "stopped"
   if reason_required and is_null(status.reason) then return false end
   if not is_null(status.reason) and (not fields(status.reason, { "code", "message" }) or not bounded_string(status.reason.code) or not bounded_string(status.reason.message)) then return false end
-  return is_null(status.last_event) or (fields(status.last_event, { "sequence", "type", "timestamp" }) and positive_integer(status.last_event.sequence) and bounded_string(status.last_event.type) and bounded_string(status.last_event.timestamp))
+  return fields(status.last_event, { "sequence", "type", "timestamp" }) and positive_integer(status.last_event.sequence)
+    and bounded_string(status.last_event.type) and bounded_string(status.last_event.timestamp)
 end
 
 function M.decode(output)
@@ -205,7 +271,9 @@ function M.decode(output)
   end
   if not bounded_string(status.run_id) or not fields(status.sprint, { "multisprint", "index" })
     or not bounded_string(status.sprint.multisprint) or not positive_integer(status.sprint.index)
-    or not bounded_string(status.state) or not validate_active(status.active, status.process_running) or not validate_run_fields(status) then return nil, "inconsistent_status" end
+    or not bounded_string(status.state) or not workflow_states[status.state]
+    or not validate_active(status.active, status.process_running) or not validate_run_fields(status) then return nil, "inconsistent_status" end
+  if terminal_states[status.state] and (status.process_running or not is_null(status.active.status)) then return nil, "inconsistent_status" end
   return status
 end
 

@@ -2,7 +2,7 @@ local loop = require("opencode_sprint_loop")
 
 loop.setup({
   executable = assert(vim.env.SPRINT_LOOP_FAKE_EXECUTABLE),
-  sprint_root = "/tmp/detached sprint",
+  sprint_root = assert(vim.env.SPRINT_LOOP_TEST_ROOT),
   server_url = "http://127.0.0.1:4096",
 })
 loop.start()

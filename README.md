@@ -25,6 +25,9 @@ consume even a synchronous return until that window closes, because the same
 function could invoke `done` later; return-plus-callback and duplicate callback
 completion are rejected before an action launches. The required `sprint_root` and
 `server_url` are not discovered or guessed.
+Resolver timers belong to the setup, watcher, or action that created them. They
+are cancelled when setup or a watcher is replaced and on Neovim exit, so a stale
+watcher resolution cannot launch another status process.
 
 All six commands are registered when the plugin loads, so invoking one before
 successful setup reports `setup_required` instead of an unknown command. A
@@ -88,9 +91,10 @@ plugin does not simulate a state change.
 Before start or resume constructs argv, it requires `server_url` to be a
 credential-free HTTP(S) origin. User-info, paths, queries, fragments, malformed
 authorities, and other schemes are rejected without echoing the value.
-Controller stderr is never copied into a notification: non-zero exits use a
-generic actionable diagnostic so credentials, credential-bearing URLs, and
-terminal controls from external processes cannot be exposed.
+Controller stderr is never copied into a notification: non-zero exits and
+signal-terminated commands use a generic actionable diagnostic so credentials,
+credential-bearing URLs, and terminal controls from external processes cannot
+be exposed.
 
 Progress calls `status --json` asynchronously and opens a disposable centered,
 read-only float. `q` and `Esc` close that buffer. It displays no-run, state,
@@ -101,10 +105,16 @@ credentials, prompts, transcripts, and question text are never displayed.
 If interruption leaves a durable active invocation, progress accepts and shows
 its truthful `running` status even when `process_running` is false; this does
 not claim that a controller process is alive. Blocked, failed, and stopped
-status documents require a reason.
+status documents require a reason. Persisted documents also require the exact V1
+state vocabulary, an update time and last event, compatible repository keys in
+object-shaped local/pushed commit maps, and no active invocation in a
+terminal state. Recognizable credentials, credential-bearing URLs, URL query or
+fragment data, and common provider-token forms in any displayed field make the
+entire status inconsistent instead of producing a lossy progress view.
 
-Setup first performs one asynchronous status observation; it starts the single
-ephemeral watcher only when that observation reports a running controller.
+Setup first performs one asynchronous status observation, notifies for a valid
+pending request in that first document, and only then starts the single
+ephemeral watcher when the document reports a running controller.
 Successful start/resume launches also begin discovery. The watcher polls at a
 bounded two-second interval with at most one status process in flight. It stops
 after an observed controller exits (including a final launch-completion observation)

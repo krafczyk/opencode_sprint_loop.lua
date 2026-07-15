@@ -27,6 +27,8 @@ completion is rejected before an action launches. `executable` defaults to
 `sprint-loop`. `web_url` is used only by
 |SprintLoopOpenSession|. `server_ca_cert`, when supplied, resolves to an absolute readable regular file
 passed only as SSL_CERT_FILE to `run` and `resume`; browser CA trust is separate.
+Resolver timers are owned by their setup, watcher, or action lifecycle. Repeated
+setup, watcher replacement, and Neovim exit cancel the relevant timers.
 Commands are registered at plugin load. Before successful setup they report
 `setup_required`; repeated setup replaces configuration and watcher state while
 preserving pending-request notification deduplication for this Neovim process.
@@ -49,13 +51,14 @@ Before `run` or `resume` argv is constructed, `server_url` must be a
 credential-free HTTP(S) origin. Malformed authorities, user-info, paths,
 queries, fragments, and unsupported schemes are rejected without echoing the
 value. Process stdout and stderr are bounded during asynchronous streaming.
-External stderr is not copied into notifications; non-zero exits use a generic
-diagnostic directing the user to progress.
+External stderr is not copied into notifications; non-zero exits and non-zero
+process signals use a generic diagnostic directing the user to progress.
 
 WATCHER                                                         *SprintLoop-watcher*
 
-Setup performs one asynchronous status observation and starts the single
-two-second, non-overlapping watcher only if a running controller is found.
+Setup performs one asynchronous status observation, notifies for a pending
+request in that validated document, and then starts the single two-second,
+non-overlapping watcher only if a running controller is found.
 Successful start/resume also begins launch discovery. A future
 `waiting_for_user` projection produces one notification
 per request ID directing the user to |SprintLoopOpenSession|. It does not expose
@@ -72,6 +75,13 @@ sequence. Relevant null evidence is shown as `-` rather than omitted.
 An interrupted durable active invocation may display `running` while
 `process_running` is false; this does not claim that the controller is alive.
 Blocked, failed, and stopped projections require a reason.
+Persisted status requires the exact V1 state vocabulary, non-null update and
+last-event evidence, object-shaped local and pushed commit maps with the same
+repository keys, and no active invocation in a terminal state. A
+truthful interrupted active invocation in a non-terminal state remains valid.
+Recognizable credentials, credential-bearing URLs, URL query/fragment data, and
+common provider-token forms in any rendered field reject the complete status as
+`inconsistent_status`; the plugin does not render a lossy sanitized projection.
 
 SECURITY                                                        *SprintLoop-security*
 

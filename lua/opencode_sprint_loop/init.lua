@@ -22,6 +22,8 @@ local state = {
   final_pending = false,
   warned = false,
   requests = {},
+  resolvers = {},
+  action_id = 0,
 }
 
 local function notify(message, level)
@@ -32,12 +34,31 @@ local function current(generation)
   return state.options ~= nil and state.generation == generation
 end
 
+local function cancel_resolvers(kind, identifier)
+  for handle, owner in pairs(state.resolvers) do
+    if kind == nil or (owner.kind == kind and (identifier == nil or owner.id == identifier)) then
+      handle.cancel()
+      state.resolvers[handle] = nil
+    end
+  end
+end
+
+local function resolve_value(value, generation, owner, predicate, callback)
+  local handle
+  handle = config.resolve(value, generation, predicate, function(result, error)
+    if handle then state.resolvers[handle] = nil end
+    callback(result, error)
+  end)
+  if handle.is_active() then state.resolvers[handle] = owner end
+end
+
 local function close_timer()
   if state.timer and not state.timer:is_closing() then state.timer:stop(); state.timer:close() end
   state.timer = nil
 end
 
 local function invalidate_watcher()
+  cancel_resolvers("watcher", state.watcher_id)
   state.watcher_id = state.watcher_id + 1
   state.watching = false
   close_timer()
@@ -60,33 +81,35 @@ end
 local function command_error(result, error)
   if error then return error end
   if type(result) ~= "table" then return "process_spawn_failed" end
-  if result.code ~= 0 then
+  if result.code ~= 0 or (type(result.signal) == "number" and result.signal ~= 0) then
     -- External stderr can contain credentials, URLs, terminal controls, or
     -- arbitrary service output. Do not attempt partial sanitization here.
     return "controller_command_failed: inspect controller status with :SprintLoopProgress"
   end
 end
 
-local function resolve_option(key, generation, callback)
-  config.resolve(state.options[key], generation, current, callback)
+local function resolve_option(key, generation, owner, predicate, callback)
+  resolve_value(state.options[key], generation, owner, predicate or current, callback)
 end
 
-local function ca_environment(generation, callback)
+local function ca_environment(generation, owner, predicate, callback)
   local value = state.options.server_ca_cert
   if not value then callback(nil, nil); return end
-  config.resolve(value, generation, current, function(path, error)
+  resolve_value(value, generation, owner, predicate or current, function(path, error)
     if error then callback(nil, error)
     elseif not config.valid_ca_path(path) then callback(nil, "invalid_server_ca_cert")
     else callback({ SSL_CERT_FILE = path }, nil) end
   end)
 end
 
-local function query_status(root, generation, callback)
-  if not current(generation) then return end
-  resolve_option("executable", generation, function(executable, executable_error)
+local function query_status(root, generation, owner, predicate, callback)
+  predicate = predicate or current
+  if not predicate(generation) then return end
+  resolve_option("executable", generation, owner, predicate, function(executable, executable_error)
     if executable_error then callback(nil, executable_error); return end
+    if not predicate(generation) then return end
     process.run({ executable, "status", "--root", root, "--json" }, {}, function(result, spawn_error)
-      if not current(generation) then return end
+      if not predicate(generation) then return end
       local error = command_error(result, spawn_error)
       if error then callback(nil, error); return end
       if result.stdout_truncated == true then callback(nil, "status_output_too_large"); return end
@@ -122,7 +145,9 @@ end
 observe = function(root, generation, watcher_id, final_observation)
   if not watcher_current(generation, watcher_id) or state.in_flight then return end
   state.in_flight = true
-  query_status(root, generation, function(document, error)
+  local owner = { kind = "watcher", id = watcher_id }
+  local predicate = function(candidate) return watcher_current(candidate, watcher_id) end
+  query_status(root, generation, owner, predicate, function(document, error)
     if not watcher_current(generation, watcher_id) then return end
     state.in_flight = false
     if error then
@@ -161,8 +186,8 @@ local function start_watcher(root, generation, already_observed)
   return watcher_id
 end
 
-local function resolve_root(generation, callback)
-  resolve_option("sprint_root", generation, callback)
+local function resolve_root(generation, owner, predicate, callback)
+  resolve_option("sprint_root", generation, owner, predicate or current, callback)
 end
 
 local function action_needs_server(name)
@@ -172,15 +197,17 @@ end
 local function controller_action(name)
   if not state.options then notify("setup_required: call setup() first"); return end
   local generation = state.generation
-  resolve_root(generation, function(root, root_error)
+  state.action_id = state.action_id + 1
+  local owner = { kind = "action", id = state.action_id }
+  resolve_root(generation, owner, current, function(root, root_error)
     if root_error then notify(root_error); return end
     local function with_server(server_url, server_error)
       if server_error then notify(server_error); return end
       if action_needs_server(name) and not url.valid_server_origin(server_url) then notify("invalid_resolved_value: server_url must be a credential-free HTTP(S) origin"); return end
-      local environment_resolver = action_needs_server(name) and ca_environment or function(_, callback) callback(nil, nil) end
-      environment_resolver(generation, function(environment, ca_error)
+      local environment_resolver = action_needs_server(name) and ca_environment or function(_, _, _, callback) callback(nil, nil) end
+      environment_resolver(generation, owner, current, function(environment, ca_error)
         if ca_error then notify(ca_error); return end
-        resolve_option("executable", generation, function(executable, executable_error)
+        resolve_option("executable", generation, owner, current, function(executable, executable_error)
           if executable_error then notify(executable_error); return end
           local argv = { executable, name, "--root", root }
           if action_needs_server(name) then table.insert(argv, "--server-url"); table.insert(argv, server_url) end
@@ -207,7 +234,7 @@ local function controller_action(name)
         end)
       end)
     end
-    if action_needs_server(name) then resolve_option("server_url", generation, with_server) else with_server(nil, nil) end
+    if action_needs_server(name) then resolve_option("server_url", generation, owner, current, with_server) else with_server(nil, nil) end
   end)
 end
 
@@ -236,15 +263,20 @@ function M.setup(options)
   if not supported then notify("unsupported_neovim: Neovim 0.12 or newer is required"); return end
   local validated, error = config.validate(options)
   if not validated then notify(error); return end
+  cancel_resolvers()
   state.generation = state.generation + 1
   invalidate_watcher()
   state.options = validated
   local generation = state.generation
-  resolve_root(generation, function(root, root_error)
+  local owner = { kind = "setup", id = generation }
+  resolve_root(generation, owner, current, function(root, root_error)
     if root_error then notify(root_error); return end
-    query_status(root, generation, function(document, query_error)
+    query_status(root, generation, owner, current, function(document, query_error)
       if query_error then notify(query_error, vim.log.levels.WARN)
-      elseif document.process_running then start_watcher(root, generation, true) end
+      else
+        notify_interaction(document)
+        if document.process_running then start_watcher(root, generation, true) end
+      end
     end)
   end)
 end
@@ -257,9 +289,11 @@ function M.stop() controller_action("stop") end
 function M.progress()
   if not state.options then notify("setup_required: call setup() first"); return end
   local generation = state.generation
-  resolve_root(generation, function(root, root_error)
+  state.action_id = state.action_id + 1
+  local owner = { kind = "action", id = state.action_id }
+  resolve_root(generation, owner, current, function(root, root_error)
     if root_error then notify(root_error); return end
-    query_status(root, generation, function(document, query_error)
+    query_status(root, generation, owner, current, function(document, query_error)
       if query_error then notify(query_error); return end
       ui.show(status.render(document))
     end)
@@ -269,13 +303,15 @@ end
 function M.open_session()
   if not state.options then notify("setup_required: call setup() first"); return end
   local generation = state.generation
-  resolve_root(generation, function(root, root_error)
+  state.action_id = state.action_id + 1
+  local owner = { kind = "action", id = state.action_id }
+  resolve_root(generation, owner, current, function(root, root_error)
     if root_error then notify(root_error); return end
-    query_status(root, generation, function(document, query_error)
+    query_status(root, generation, owner, current, function(document, query_error)
       if query_error then notify(query_error); return end
       if not document.run_exists or type(document.active) ~= "table" or type(document.active.session_id) ~= "string" or document.active.session_id == "" then notify("active_session_unavailable"); return end
       if not state.options.web_url then notify("web_url_unavailable"); return end
-      resolve_option("web_url", generation, function(base, web_error)
+      resolve_option("web_url", generation, owner, current, function(base, web_error)
         if web_error then notify(web_error); return end
         local normalized = url.normalize_web_base(base)
         if not normalized then notify("invalid_web_url"); return end
@@ -295,8 +331,12 @@ function M._test_state() return state end
 function M._test_set_browser(opener) browser_override = opener end
 function M._test_set_watch_interval(milliseconds) WATCH_INTERVAL_MS = milliseconds end
 function M._test_set_version_check(checker) version_check_override = checker end
+function M._test_replace_watcher(root)
+  if state.options then start_watcher(root, state.generation, false) end
+end
 function M._test_reset()
   local next_generation = state.generation + 1
+  cancel_resolvers()
   invalidate_watcher()
   state = {
     options = nil,
@@ -310,11 +350,16 @@ function M._test_reset()
     final_pending = false,
     warned = false,
     requests = {},
+    resolvers = {},
+    action_id = 0,
   }
   browser_override = nil
   version_check_override = nil
   WATCH_INTERVAL_MS = 2000
 end
 
-vim.api.nvim_create_autocmd("VimLeavePre", { callback = invalidate_watcher })
+vim.api.nvim_create_autocmd("VimLeavePre", { callback = function()
+  cancel_resolvers()
+  invalidate_watcher()
+end })
 return M
