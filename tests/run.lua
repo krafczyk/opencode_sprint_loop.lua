@@ -356,6 +356,57 @@ wait_for(function()
   return count == pauses_before_command + 1
 end, "registered command delegates through the public pause behavior")
 
+-- Every configured command exercises the same complete public path as its Lua method.
+do
+  local command_counts = { status = 0, run = 0, pause = 0, resume = 0, stop = 0 }
+  local command_browser_targets = {}
+  clear_notifications(); loop._test_reset(); loop._test_set_watch_interval(1000)
+  if ui.window and vim.api.nvim_win_is_valid(ui.window) then vim.api.nvim_win_close(ui.window, true) end
+  ui.buffer, ui.window = nil, nil
+  loop._test_set_browser(function(target)
+    table.insert(command_browser_targets, target)
+    return browser_result(0, 0, 1)
+  end)
+  process.set_runner_for_test(function(argv, _, callback)
+    command_counts[argv[2]] = (command_counts[argv[2]] or 0) + 1
+    vim.schedule(function()
+      callback({
+        code = 0,
+        signal = 0,
+        stdout = argv[2] == "status" and json(persisted("validating", false, "running")) or "",
+        stderr = "",
+      })
+    end)
+    return {}
+  end)
+  loop.setup({
+    executable = "configured-fake", sprint_root = "/tmp/configured-commands",
+    server_url = "http://127.0.0.1:4096", web_url = "https://example.test",
+  })
+  wait_for(function() return command_counts.status == 1 end, "configured command setup observation completes")
+  for _, name in ipairs(command_names) do vim.cmd(name) end
+  wait_for(function()
+    return command_counts.run >= 1 and command_counts.pause >= 1 and command_counts.resume >= 1
+      and command_counts.stop >= 1 and #command_browser_targets == 1
+      and ui.buffer ~= nil and vim.api.nvim_buf_is_valid(ui.buffer)
+  end, "all six configured commands complete their public delegation paths", 2000)
+  check(command_counts.run == 1, "SprintLoopStart delegates through configured start")
+  check(ui.buffer ~= nil and vim.api.nvim_buf_is_valid(ui.buffer), "SprintLoopProgress delegates through configured progress")
+  check(command_counts.pause == 1, "SprintLoopPause delegates through configured pause")
+  check(command_counts.resume == 1, "SprintLoopResume delegates through configured resume")
+  check(command_counts.stop == 1, "SprintLoopStop delegates through configured stop")
+  check(command_browser_targets[1]:find("/session/ses%2Fone%20two", 1, true) ~= nil, "SprintLoopOpenSession delegates through configured session opening")
+end
+loop._test_reset()
+process.set_runner_for_test(function(argv, options, callback)
+  table.insert(calls, { argv = vim.deepcopy(argv), options = options })
+  vim.schedule(function()
+    local is_control = argv[2] == "pause" or argv[2] == "resume" or argv[2] == "stop"
+    callback({ code = is_control and 4 or 0, signal = 0, stdout = argv[2] == "status" and json(status_document) or "", stderr = is_control and "feature_not_implemented" or "" })
+  end)
+  return {}
+end)
+
 for _, invalid in ipairs({
   "ssh://host", "http://host:", "http://user:synthetic-secret@host", "http://host?token=synthetic-secret", "http://host#synthetic-secret",
   "http://glpat-" .. string.rep("A", 20) .. ".example.test",
@@ -425,6 +476,28 @@ local cancelled_ca = config.validate_ca_path(ca_path, 1, function() return true 
 cancelled_ca.cancel()
 vim.wait(30)
 check(not cancelled_ca_callback and not cancelled_ca.is_active(), "asynchronous CA validation cancellation suppresses delivery")
+
+local fifo_path = vim.fn.tempname()
+local fifo_create = vim.system({ "mkfifo", fifo_path }):wait(1000)
+check(fifo_create.code == 0, "FIFO CA fixture is created within a bound")
+local fifo_calls = {}
+clear_notifications(); loop._test_reset()
+process.set_runner_for_test(function(argv, _, callback)
+  table.insert(fifo_calls, vim.deepcopy(argv))
+  vim.schedule(function() callback({ code = 0, signal = 0, stdout = argv[2] == "status" and json(no_run()) or "", stderr = "" }) end)
+  return {}
+end)
+loop.setup({
+  executable = "fake", sprint_root = "/tmp/fifo-ca", server_url = "https://example.test",
+  server_ca_cert = fifo_path,
+})
+wait_for(function() return #fifo_calls == 1 end, "FIFO CA setup observation completes")
+loop.start()
+wait_for(function() return notification_count("invalid_server_ca_cert") == 1 end, "FIFO CA rejects publicly without a blocking open")
+local fifo_run_count = 0
+for _, argv in ipairs(fifo_calls) do if argv[2] == "run" then fifo_run_count = fifo_run_count + 1 end end
+check(fifo_run_count == 0, "FIFO CA cannot launch a controller child")
+check(vim.fn.delete(fifo_path) == 0, "FIFO CA fixture is removed")
 
 local resume_ca_calls = {}
 clear_notifications(); loop._test_reset()
@@ -678,6 +751,15 @@ check(status.decode(json(unknown)) ~= nil, "unknown additional fields are ignore
 local wrong_schema = no_run(); wrong_schema.schema_version = 2
 decoded, decode_error = status.decode(json(wrong_schema))
 check(decoded == nil and decode_error == "unsupported_status_schema", "unknown status schema rejects")
+decoded, decode_error = status.decode('{"schema_version":2,"future_shape":true}')
+check(decoded == nil and decode_error == "unsupported_status_schema", "future reduced status shape is classified by schema before V1 fields")
+decoded, decode_error = status.decode('{"schema_version":true}')
+check(decoded == nil and decode_error == "unsupported_status_schema", "boolean status schema rejects as unsupported")
+decoded, decode_error = status.decode('{"schema_version":"1"}')
+check(decoded == nil and decode_error == "unsupported_status_schema", "non-number status schema rejects as unsupported")
+local missing_stable_field = no_run(); missing_stable_field.controller_version = nil
+decoded, decode_error = status.decode(json(missing_stable_field))
+check(decoded == nil and decode_error == "inconsistent_status", "removed required stable status field rejects as inconsistent V1")
 local contradiction = persisted("paused", false, "running")
 decoded, decode_error = status.decode(json(contradiction))
 check(decoded ~= nil and decode_error == nil, "interrupted durable running invocation remains truthful")
@@ -697,6 +779,10 @@ local malformed_interaction = persisted("implementing", true, "waiting_for_user"
 malformed_interaction.active.interaction.question_count = 0
 decoded, decode_error = status.decode(json(malformed_interaction))
 check(decoded == nil and decode_error == "inconsistent_status", "malformed interaction counter rejects")
+malformed_interaction = persisted("implementing", true, "waiting_for_user")
+malformed_interaction.active.interaction.question_count = true
+decoded, decode_error = status.decode(json(malformed_interaction))
+check(decoded == nil and decode_error == "inconsistent_status", "boolean interaction question count rejects")
 local malformed_counter = persisted("paused", false)
 malformed_counter.counters.implementation_cycles = -1
 decoded, decode_error = status.decode(json(malformed_counter))
@@ -894,6 +980,24 @@ loop.open_session(); wait_for(function() return opened_target ~= nil end, "brows
 wait_for(function() return notification_count("opened active session") == 1 end, "asynchronous browser success is observed without blocking")
 local expected_root = vim.base64.encode(status_document.sprint_root):gsub("%+", "-"):gsub("/", "_"):gsub("=+$", "")
 check(opened_target == "https://example.test/prefix/" .. expected_root .. "/session/ses%2Fone%20two", "session route encodes canonical root and one path segment")
+local retained_attempts, retained_timeouts = 0, {}
+loop._test_set_browser(function()
+  return {
+    is_closing = function() return true end,
+    wait = function(_, timeout)
+      retained_attempts = retained_attempts + 1
+      table.insert(retained_timeouts, timeout)
+      if retained_attempts < 3 then return nil end
+      return { code = 0, signal = 0, stdout = "", stderr = "" }
+    end,
+  }
+end)
+clear_notifications(); loop.open_session()
+wait_for(function() return notification_count("opened active session") == 1 end, "closing browser handle is polled until its retained result is available")
+check(retained_attempts >= 3, "closing-before-result browser handle continues timer polling")
+local all_browser_waits_nonblocking = true
+for _, timeout in ipairs(retained_timeouts) do if timeout ~= 0 then all_browser_waits_nonblocking = false end end
+check(all_browser_waits_nonblocking, "browser result observation uses only wait(0)")
 loop._test_set_browser(function() return nil, "no handler" end)
 clear_notifications(); loop.open_session(); wait_for(function() return notification_count("browser_open_failed") == 1 end, "nil,error browser return fails")
 loop._test_set_browser(function() error("synthetic browser failure") end)
@@ -903,6 +1007,27 @@ clear_notifications(); loop.open_session(); wait_for(function() return notificat
 loop._test_set_browser(function() return {} end)
 clear_notifications(); loop.open_session(); wait_for(function() return notification_count("handler completion unavailable") == 1 end, "unobservable browser handler is reported without claiming success")
 check(notification_count("opened active session") == 0, "unobservable browser handler never claims terminal success")
+loop._test_set_browser_observation_timeout(30)
+loop._test_set_browser(function()
+  return { is_closing = function() return false end, wait = function() error("wait must not run before close") end }
+end)
+clear_notifications(); loop.open_session()
+wait_for(function() return notification_count("browser_open_failed") == 1 end, "browser observation timeout is bounded")
+check(table_count(loop._test_state().openers) == 0, "timed-out browser observation closes its timer")
+loop._test_set_browser_observation_timeout(5000)
+local cancelled_browser_waits = 0
+loop._test_set_browser(function()
+  return {
+    is_closing = function() return false end,
+    wait = function() cancelled_browser_waits = cancelled_browser_waits + 1 end,
+  }
+end)
+clear_notifications(); loop.open_session()
+wait_for(function() return table_count(loop._test_state().openers) == 1 end, "pending browser observation owns one timer")
+loop.setup({ executable = "fake", sprint_root = "/tmp/reconfigured", server_url = "http://127.0.0.1" })
+check(table_count(loop._test_state().openers) == 0, "setup replacement cancels browser observation timer")
+vim.wait(100)
+check(cancelled_browser_waits == 0, "cancelled browser observation cannot call wait later")
 for _, invalid in ipairs({
   "ftp://host", "http://", "http://user:synthetic-secret@host", "http://host?x=synthetic-secret", "http://host#synthetic-secret",
   "https://example.test/prefix/token=synthetic-secret", "https://example.test/prefix/glpat-" .. string.rep("A", 20),
@@ -917,6 +1042,16 @@ for _, invalid in ipairs({
 end
 status_document = no_run(); clear_notifications(); loop.open_session()
 wait_for(function() return notification_count("active_session_unavailable") == 1 end, "no-run session opening fails actionably")
+status_document = persisted("paused", false)
+local inactive_browser_calls = 0
+clear_notifications(); loop._test_reset()
+loop._test_set_browser(function() inactive_browser_calls = inactive_browser_calls + 1; return browser_result() end)
+local inactive_setup_calls = #calls
+loop.setup({ executable = "fake", sprint_root = "/tmp/root", server_url = "http://127.0.0.1", web_url = "https://example.test" })
+wait_for(function() return #calls > inactive_setup_calls and loop._test_state().status_active == nil end, "inactive persisted session setup status completes")
+loop.open_session()
+wait_for(function() return notification_count("active_session_unavailable") == 1 end, "inactive persisted run without an active session fails actionably")
+check(inactive_browser_calls == 0, "inactive persisted run never invokes the browser")
 status_document = persisted("validating", true, "running"); clear_notifications(); loop._test_reset()
 loop.setup({ executable = "fake", sprint_root = "/tmp/root", server_url = "http://127.0.0.1" })
 vim.wait(30); loop.open_session()
@@ -1409,6 +1544,16 @@ if not survived then io.stderr:write("Detached diagnostic: " .. vim.inspect(nest
 check(survived, "detached controller writes stdout and stderr after Neovim exit, then survives")
 check(vim.fn.filereadable(marker) == 1 and vim.fn.readfile(marker)[1] == "survived", "detached child records independent completion after both writes")
 check(vim.fn.delete(detached_directory, "rf") == 0, "detached test removes only its unique owned directory")
+
+local help_smoke_root = vim.fn.tempname()
+local help_smoke_doc = help_smoke_root .. "/doc"
+check(vim.fn.mkdir(help_smoke_doc, "p", 448) == 1, "manual-install help smoke creates a unique doc directory")
+local help_source = vim.fn.getcwd() .. "/doc/opencode_sprint_loop.txt"
+vim.fn.writefile(vim.fn.readfile(help_source), help_smoke_doc .. "/opencode_sprint_loop.txt")
+local helptags_ok = pcall(vim.cmd, "silent helptags " .. vim.fn.fnameescape(help_smoke_doc))
+local generated_tags = helptags_ok and table.concat(vim.fn.readfile(help_smoke_doc .. "/tags"), "\n") or ""
+check(helptags_ok and generated_tags:find("SprintLoop", 1, true) ~= nil, "manual-install helptags generation exposes SprintLoop help")
+check(vim.fn.delete(help_smoke_root, "rf") == 0, "manual-install help smoke removes only its unique directory")
 vim.env.SPRINT_LOOP_FAKE_MODE = prior_fake_mode
 
 loop._test_reset()

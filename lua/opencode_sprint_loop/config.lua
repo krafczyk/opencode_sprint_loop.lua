@@ -152,7 +152,7 @@ function M._test_set_before_delivery(callback)
   before_delivery_for_test = callback
 end
 
----Validate a CA path through asynchronous libuv open/fstat/close operations.
+---Validate a CA path through asynchronous libuv stat/open/fstat/close operations.
 ---@return table handle cancellable validation-lifetime handle
 function M.validate_ca_path(path, generation, current, callback)
   local cancelled, delivered = false, false
@@ -173,15 +173,29 @@ function M.validate_ca_path(path, generation, current, callback)
     deliver(false)
     return handle
   end
-  vim.uv.fs_open(path, "r", 0, function(open_error, file_descriptor)
-    if open_error or not file_descriptor then
+  vim.uv.fs_stat(path, function(stat_error, path_details)
+    if cancelled then return end
+    -- Opening a FIFO for reading can occupy a libuv worker indefinitely. Reject
+    -- every non-regular path from metadata before attempting the readability
+    -- open; fstat below still verifies the opened descriptor.
+    if stat_error or not path_details or path_details.type ~= "file" then
       deliver(false)
       return
     end
-    vim.uv.fs_fstat(file_descriptor, function(stat_error, details)
-      local valid = stat_error == nil and details ~= nil and details.type == "file"
-      vim.uv.fs_close(file_descriptor, function()
-        deliver(valid)
+    vim.uv.fs_open(path, "r", 0, function(open_error, file_descriptor)
+      if open_error or not file_descriptor then
+        deliver(false)
+        return
+      end
+      if cancelled then
+        vim.uv.fs_close(file_descriptor, function() end)
+        return
+      end
+      vim.uv.fs_fstat(file_descriptor, function(fstat_error, details)
+        local valid = fstat_error == nil and details ~= nil and details.type == "file"
+        vim.uv.fs_close(file_descriptor, function(close_error)
+          deliver(valid and close_error == nil)
+        end)
       end)
     end)
   end)

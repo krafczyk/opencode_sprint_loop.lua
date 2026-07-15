@@ -214,9 +214,12 @@ function M.decode(output)
   if #output > M.MAX_STATUS_BYTES then return nil, "status_output_too_large" end
   if not valid_utf8(output) or not no_duplicate_keys(output) then return nil, "invalid_status_json" end
   local ok, status = pcall(vim.json.decode, output)
-  if not ok or type(status) ~= "table" then return nil, "invalid_status_json" end
-  if not fields(status, required) then return nil, "inconsistent_status" end
+  if not ok or type(status) ~= "table" or vim.islist(status) then return nil, "invalid_status_json" end
+  -- Classify the version before applying the V1 shape. A future schema may
+  -- deliberately remove or rename V1 fields and must still receive the stable
+  -- compatibility diagnostic rather than looking like corrupt V1 output.
   if status.schema_version ~= 1 or type(status.schema_version) ~= "number" then return nil, "unsupported_status_schema" end
+  if not fields(status, required) then return nil, "inconsistent_status" end
   if not bounded_string(status.controller_version) or not bounded_string(status.sprint_root)
     or type(status.run_exists) ~= "boolean" or type(status.process_running) ~= "boolean" then return nil, "inconsistent_status" end
   if not status.run_exists then

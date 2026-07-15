@@ -6,7 +6,24 @@ OpenCode question APIs, persistence, CI, or a server launcher.
 
 ## Installation and setup
 
-Put this repository on Neovim's runtime path, then configure it explicitly:
+Plugin managers should add this repository to Neovim's runtime path and run
+their normal install/update step. Ensure the manager's help-tag generation is
+enabled; if it does not generate tags automatically, run `:helptags ALL` after
+installation.
+
+For a manual native-package installation, clone the repository beneath a
+`pack/*/start` directory and generate tags for its `doc` directory explicitly:
+
+```bash
+git clone git@github.com:krafczyk/opencode_sprint_loop.lua.git \
+  ~/.local/share/nvim/site/pack/sprint-loop/start/opencode_sprint_loop.lua
+nvim --headless \
+  "+helptags ~/.local/share/nvim/site/pack/sprint-loop/start/opencode_sprint_loop.lua/doc" \
+  +qa
+```
+
+After either installation path, `:help SprintLoop` must open this plugin's help.
+Then configure it explicitly:
 
 ```lua
 require("opencode_sprint_loop").setup({
@@ -71,8 +88,9 @@ require("opencode_sprint_loop").setup({
 ```
 
 When the optional `server_ca_cert` resolver is configured, it must resolve to
-an absolute readable regular file. Readability and file type are checked through
-asynchronous libuv open, fstat, and close callbacks. Its path is supplied only as `SSL_CERT_FILE` to `run` and `resume` child
+an absolute readable regular file. An asynchronous libuv stat rejects directories,
+devices, and FIFOs before open; readability and the opened descriptor type are
+then checked through asynchronous open, fstat, and close callbacks. Its path is supplied only as `SSL_CERT_FILE` to `run` and `resume` child
 processes; it is neither placed in argv nor used to configure browser trust.
 Trust a private CA separately in the browser.
 
@@ -160,9 +178,11 @@ through Neovim. Missing web configuration, no active session, invalid web URL,
 and browser failures are actionable notifications. Browser-facing URLs must be
 credential-free HTTP(S) bases.
 Neovim 0.12 returns an asynchronous handler process. The plugin observes that
-handle without waiting on the interaction path, reports terminal success only
-after a zero exit, and reports non-zero or signalled completion as
-`browser_open_failed`. A missing handler fails immediately; an overridden handler
+handle with bounded timer polling and only zero-timeout `wait(0)` result probes;
+it never performs an unbounded wait on the interaction path. A closing handle
+whose result is not retained yet continues polling within a five-second bound.
+The plugin reports terminal success only after a zero exit, and reports non-zero,
+signalled, or observation-timeout completion as `browser_open_failed`. A missing handler fails immediately; an overridden handler
 whose completion cannot be observed receives a warning and no success claim.
 Deployment path prefixes may use RFC 3986 path characters and valid percent
 escapes. Raw spaces, malformed percent escapes, backslashes, and other invalid

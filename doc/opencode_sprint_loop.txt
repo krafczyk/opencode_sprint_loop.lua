@@ -3,10 +3,21 @@
 =============================================================================
 CONTENTS                                                         *SprintLoop*
 
-This plugin requires Neovim 0.12 and an installed |sprint-loop| executable.
+This plugin requires Neovim 0.12 and an installed `sprint-loop` executable.
 Call `require("opencode_sprint_loop").setup()` before any action. It is a
 launcher/status client only: it does not start OpenCode, own workflow state,
 read controller files, inspect Git, or answer questions.
+
+Install with a plugin manager's normal install/update step and its automatic
+help-tag generation. If the manager does not generate help tags, run
+`:helptags ALL`. For manual installation, place the checkout under a
+`pack/*/start` directory and run this command with its concrete path:
+
+>vim
+  :helptags ~/.local/share/nvim/site/pack/sprint-loop/start/opencode_sprint_loop.lua/doc
+<
+
+After installation, `:help SprintLoop` opens this document.
 
 SETUP                                                            *SprintLoop-setup*
 
@@ -27,8 +38,9 @@ URL function results remain private for a five-second arbitration window so
 delayed return-plus-callback or duplicate completion rejects before launch.
 `executable` defaults to `sprint-loop`. `web_url` is used only by
 |SprintLoopOpenSession|. `server_ca_cert`, when supplied, resolves to an
-absolute readable regular file. Readability and file type are checked through
-asynchronous libuv open/fstat/close callbacks. The path is passed only as
+absolute readable regular file. Asynchronous libuv stat rejects FIFOs, devices,
+and directories before open; open/fstat/close callbacks then verify readability
+and the descriptor type. The path is passed only as
 SSL_CERT_FILE to `run` and `resume`; browser CA trust is separate.
 Setup resolves root and executable for its mandatory initial status observation;
 later actions re-resolve every option they need. Resolver lifetimes are owned by
@@ -122,9 +134,11 @@ belong in user setup and are not hard-coded by the plugin.
 Browser path prefixes accept RFC 3986 path characters and valid percent
 escapes; raw spaces, malformed escapes, backslashes, and invalid URL characters
 are rejected.
-Neovim 0.12 browser-handler completion is observed asynchronously. Zero exit is
-reported as success; non-zero or signalled completion reports
-`browser_open_failed`. Missing handlers fail immediately. Unobservable overridden
+Neovim 0.12 browser-handler completion is observed asynchronously with bounded
+timer polling and zero-timeout `wait(0)` probes only. A closing handle is polled
+until its retained result appears or the five-second observation bound expires.
+Zero exit is reported as success; non-zero, signalled, or timed-out completion
+reports `browser_open_failed`. Missing handlers fail immediately. Unobservable overridden
 handlers receive a warning and no terminal-success claim.
 
 CONTROLS                                                        *SprintLoop-controls*

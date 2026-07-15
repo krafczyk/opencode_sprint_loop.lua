@@ -7,6 +7,7 @@ local url = require("opencode_sprint_loop.url")
 
 local M = {}
 local WATCH_INTERVAL_MS = 2000
+local BROWSER_OBSERVATION_TIMEOUT_MS = 5000
 local commands_registered = false
 local browser_override = nil
 local version_check_override = nil
@@ -419,19 +420,24 @@ function M.open_session()
         end
         local timer = vim.uv.new_timer()
         state.openers[timer] = true
+        local observation_started = vim.uv.hrtime()
         local function close()
           state.openers[timer] = nil
           if not timer:is_closing() then timer:stop(); timer:close() end
         end
         timer:start(0, 50, vim.schedule_wrap(function()
           if not current(generation) then close(); return end
+          local elapsed_ms = (vim.uv.hrtime() - observation_started) / 1000000
+          if elapsed_ms >= BROWSER_OBSERVATION_TIMEOUT_MS then close(); notify("browser_open_failed"); return end
           local observed, closing = pcall(handle.is_closing, handle)
           if not observed then close(); notify("browser_open_failed"); return end
           if not closing then return end
+          -- A SystemObj handle can start closing before its retained result is
+          -- available. Poll with a zero timeout and keep the timer alive until
+          -- the result arrives or the observation bound expires.
+          local waited, result = pcall(handle.wait, handle, 0)
+          if waited and result == nil then return end
           close()
-          -- is_closing() means the process has reached terminal completion;
-          -- wait() only retrieves the retained result and does not block here.
-          local waited, result = pcall(handle.wait, handle)
           if not waited or type(result) ~= "table" or result.code ~= 0 or (type(result.signal) == "number" and result.signal ~= 0) then
             notify("browser_open_failed")
           else
@@ -446,6 +452,7 @@ end
 function M._test_state() return state end
 function M._test_set_browser(opener) browser_override = opener end
 function M._test_set_watch_interval(milliseconds) WATCH_INTERVAL_MS = milliseconds end
+function M._test_set_browser_observation_timeout(milliseconds) BROWSER_OBSERVATION_TIMEOUT_MS = milliseconds end
 function M._test_set_version_check(checker) version_check_override = checker end
 function M._test_replace_watcher(root)
   if state.options then start_watcher(root, state.generation, false) end
@@ -478,6 +485,7 @@ function M._test_reset()
   browser_override = nil
   version_check_override = nil
   WATCH_INTERVAL_MS = 2000
+  BROWSER_OBSERVATION_TIMEOUT_MS = 5000
 end
 
 vim.api.nvim_create_autocmd("VimLeavePre", { callback = function()
