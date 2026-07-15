@@ -88,13 +88,36 @@ local production_resolver_timeout = config.RESOLVER_TIMEOUT_MS
 config.RESOLVER_TIMEOUT_MS = 20
 clear_notifications(); loop.setup({ sprint_root = "/tmp/root" })
 check(notification_count("invalid_setup") == 1 and #calls == 0, "missing required setup field fails without process")
-clear_notifications(); loop.setup({ sprint_root = "/tmp/root", server_url = "http://127.0.0.1", surprise = true })
-check(notification_count("unknown option") == 1, "unknown setup key fails")
+for _, unknown_key in ipairs({
+  "api_key=synthetic-setup-credential",
+  "https://user:synthetic-setup-credential@example.invalid/path",
+  "unknown\n\27control",
+  string.rep("oversized", 16384),
+}) do
+  clear_notifications()
+  loop.setup({ sprint_root = "/tmp/root", server_url = "http://127.0.0.1", [unknown_key] = true })
+  check(#notifications == 1 and notifications[1].message == "SprintLoop: invalid_setup", "unknown setup key uses fixed diagnostic")
+  check(not vim.inspect(notifications):find(unknown_key, 1, true) and #calls == 0, "unknown setup key content is never disclosed")
+end
 clear_notifications(); loop.setup({ sprint_root = {}, server_url = "http://127.0.0.1" })
 check(notification_count("invalid_setup") == 1 and #calls == 0, "wrong setup value type fails")
 loop._test_set_version_check(function() return false end)
 clear_notifications(); loop.setup({ sprint_root = "/tmp/root", server_url = "http://127.0.0.1" })
 check(notification_count("unsupported_neovim") == 1 and #calls == 0, "controlled older-version fixture fails without mutation")
+loop._test_reset()
+
+-- The public setup/action path uses the exact documented executable default.
+calls = {}
+process.set_runner_for_test(function(argv, options, callback)
+  table.insert(calls, { argv = vim.deepcopy(argv), options = options })
+  vim.schedule(function() callback({ code = 0, signal = 0, stdout = argv[2] == "status" and json(no_run()) or "", stderr = "" }) end)
+  return {}
+end)
+loop.setup({ sprint_root = "/tmp/default-root", server_url = "http://127.0.0.1" })
+wait_for(function() return #calls == 1 end, "default executable drives setup status")
+loop.pause()
+wait_for(function() return #calls == 2 end, "default executable drives public action")
+check(calls[1].argv[1] == "sprint-loop" and calls[2].argv[1] == "sprint-loop", "public path defaults executable to exact sprint-loop")
 loop._test_reset()
 
 local function resolve_result(value, timeout)
@@ -279,6 +302,82 @@ check(not config.valid_ca_path("/dev/null"), "non-regular readable device cannot
 check(not config.valid_ca_path(vim.fn.fnamemodify(ca_path, ":h")), "directory cannot be a CA certificate")
 vim.fn.delete(ca_path)
 
+-- Every setup option form is proven through public status/action/session/CA wiring.
+local function public_option_matrix(label, options, expected)
+  local matrix_calls, opened = {}, nil
+  loop._test_reset()
+  loop._test_set_browser(function(target) opened = target; return {} end)
+  process.set_runner_for_test(function(argv, process_options, callback)
+    table.insert(matrix_calls, { argv = vim.deepcopy(argv), options = process_options })
+    vim.schedule(function()
+      callback({
+        code = 0,
+        signal = 0,
+        stdout = argv[2] == "status" and json(persisted("validating", false, "running")) or "",
+        stderr = "",
+      })
+    end)
+    return {}
+  end)
+  loop.setup(options)
+  wait_for(function() return #matrix_calls >= 1 end, label .. " setup status spawns")
+  loop.start()
+  wait_for(function()
+    for _, call in ipairs(matrix_calls) do if call.argv[2] == "run" then return true end end
+  end, label .. " start spawns")
+  loop.open_session()
+  wait_for(function() return opened ~= nil end, label .. " session opens")
+  local status_call, run_call
+  for _, call in ipairs(matrix_calls) do
+    if call.argv[2] == "status" and not status_call then status_call = call end
+    if call.argv[2] == "run" then run_call = call end
+  end
+  check(vim.deep_equal(status_call.argv, { expected.executable, "status", "--root", expected.root, "--json" }), label .. " executable/root reach public status")
+  check(vim.deep_equal(run_call.argv, { expected.executable, "run", "--root", expected.root, "--server-url", expected.server }), label .. " server reaches public start")
+  check(run_call.options.env.SSL_CERT_FILE == expected.ca and not vim.tbl_contains(run_call.argv, expected.ca), label .. " CA reaches only child environment")
+  check(opened:find(expected.web, 1, true) == 1 and opened:find("/session/ses%2Fone%20two", 1, true) ~= nil, label .. " web URL reaches public session route")
+end
+
+local string_ca = vim.fn.tempname()
+vim.fn.writefile({ "synthetic string CA" }, string_ca)
+public_option_matrix("string option forms", {
+  executable = "string-executable",
+  sprint_root = "/tmp/string-root",
+  server_url = "https://string.example.test",
+  web_url = "https://string-web.example.test/prefix",
+  server_ca_cert = string_ca,
+}, {
+  executable = "string-executable", root = "/tmp/string-root", server = "https://string.example.test",
+  web = "https://string-web.example.test/prefix", ca = string_ca,
+})
+vim.fn.delete(string_ca)
+
+local function_ca = vim.fn.tempname()
+vim.fn.writefile({ "synthetic function CA" }, function_ca)
+local callback_counts = { server = 0, web = 0, ca = 0 }
+public_option_matrix("function option forms", {
+  executable = function() return "function-executable" end,
+  sprint_root = function() return "/tmp/function-root" end,
+  server_url = function(done)
+    callback_counts.server = callback_counts.server + 1
+    vim.defer_fn(function() done("https://function.example.test") end, 1)
+  end,
+  web_url = function(done)
+    callback_counts.web = callback_counts.web + 1
+    vim.defer_fn(function() done("https://function-web.example.test/prefix") end, 1)
+  end,
+  server_ca_cert = function()
+    callback_counts.ca = callback_counts.ca + 1
+    return function_ca
+  end,
+}, {
+  executable = "function-executable", root = "/tmp/function-root", server = "https://function.example.test",
+  web = "https://function-web.example.test/prefix", ca = function_ca,
+})
+check(callback_counts.server >= 1 and callback_counts.web == 1 and callback_counts.ca >= 1, "callback URL and function CA resolvers are consumed by public actions")
+vim.fn.delete(function_ca)
+loop._test_reset()
+
 -- Status grammar, compatibility states, malformed categories, and complete rendering.
 for _, fixture in ipairs({
   no_run(), persisted("validating", true, "running"), persisted("implementing", true, "waiting_for_user"),
@@ -385,6 +484,30 @@ for index, case in ipairs(rendered_credentials) do
   case[2](document, unsafe)
   decoded, decode_error = status.decode(json(document))
   check(decoded == nil and decode_error == "inconsistent_status", case[1] .. " rejects credential-bearing display text")
+end
+local provider_families = {
+  { "GitHub server", "ghs_" .. string.rep("A.", 18), "ghs_" .. string.rep("A", 35) },
+  { "GitHub OAuth/PAT", "ghp_" .. string.rep("A", 36), "ghp_" .. string.rep("A", 35) },
+  { "GitHub fine-grained", "github_pat_" .. string.rep("A_", 10), "github_pat_" .. string.rep("-", 20) },
+  { "GitLab", "glpat-" .. string.rep("A_", 10), "glpat-" .. string.rep(".", 20) },
+  { "OpenAI generic", "sk-" .. string.rep("A_", 10), "sk-" .. string.rep(".", 20) },
+  { "Anthropic", "sk-ant-api01-" .. string.rep("A", 20), "sk-ant-api01-" .. string.rep(".", 20) },
+  { "OpenRouter", "sk-or-v1-" .. string.rep("A", 20), "sk-or-v1-" .. string.rep(".", 20) },
+  { "Google", "AIza" .. string.rep("A_", 15), "AIza" .. string.rep(".", 30) },
+  { "Hugging Face", "hf_" .. string.rep("A", 20), "hf_" .. string.rep("_", 20) },
+  { "Slack OAuth", "xoxb-" .. string.rep("A-", 10), "xoxb-" .. string.rep("_", 20) },
+  { "Slack app", "xapp-" .. string.rep("A-", 10), "xapp-" .. string.rep("_", 20) },
+  { "AWS", "AKIA" .. string.rep("A", 16), "AKIA" .. string.rep("_", 16) },
+}
+for _, family in ipairs(provider_families) do
+  local credential_document = persisted("validating", false, "running")
+  credential_document.updated_at = family[2]
+  decoded, decode_error = status.decode(json(credential_document))
+  check(decoded == nil and decode_error == "inconsistent_status", family[1] .. " recognized token rejects")
+  local near_miss_document = persisted("validating", false, "running")
+  near_miss_document.updated_at = family[3]
+  decoded, decode_error = status.decode(json(near_miss_document))
+  check(decoded ~= nil and decode_error == nil, family[1] .. " unsupported near miss remains accepted")
 end
 local rendered = table.concat(status.render(persisted("validating", true, "running")), "\n")
 for _, evidence in ipairs({ "remaining effort -", "commit -", "3 not evaluated", "assessed -", "Last event: #9" }) do check(rendered:find(evidence, 1, true) ~= nil, "progress renders " .. evidence) end
@@ -509,6 +632,107 @@ loop.setup(setup_options)
 wait_for(function() return sequence >= 7 end, "watcher exercises failure recovery", 1000)
 check(max_concurrent == 1, "watcher permits at most one status process in flight")
 check(notification_count("controller_command_failed") == 2, "watcher warns once per continuous failure episode")
+loop._test_reset()
+
+-- Setup/watcher replacement serializes globally and only cancels status children.
+local lifecycle_active, lifecycle_max = 0, 0
+local lifecycle_status_spawns, lifecycle_status_kills, lifecycle_controller_kills = 0, 0, 0
+local lifecycle_controller_spawns = 0
+clear_notifications(); loop._test_reset(); loop._test_set_watch_interval(1000)
+process.set_runner_for_test(function(argv, _, callback)
+  if argv[2] ~= "status" then
+    lifecycle_controller_spawns = lifecycle_controller_spawns + 1
+    local completed = false
+    vim.defer_fn(function()
+      if completed then return end
+      completed = true
+      callback({ code = 0, signal = 0, stdout = "", stderr = "" })
+    end, 30)
+    return { kill = function()
+      lifecycle_controller_kills = lifecycle_controller_kills + 1
+    end }
+  end
+  lifecycle_status_spawns = lifecycle_status_spawns + 1
+  lifecycle_active = lifecycle_active + 1
+  lifecycle_max = math.max(lifecycle_max, lifecycle_active)
+  local completed, kill_requested = false, false
+  local function complete(signal)
+    if completed then return end
+    completed = true
+    lifecycle_active = lifecycle_active - 1
+    callback({
+      code = signal and 1 or 0,
+      signal = signal or 0,
+      stdout = signal and "" or json(persisted("validating", true, "running")),
+      stderr = "",
+    })
+  end
+  vim.defer_fn(function() complete(nil) end, 80)
+  return { kill = function(_, signal)
+    if completed or kill_requested then return end
+    kill_requested = true
+    lifecycle_status_kills = lifecycle_status_kills + 1
+    vim.schedule(function() complete(signal or 15) end)
+  end }
+end)
+
+local lifecycle_options = { executable = "fake", sprint_root = "/tmp/lifecycle-one", server_url = "http://127.0.0.1" }
+loop.setup(lifecycle_options)
+wait_for(function() return lifecycle_active == 1 end, "delayed setup status child is retained")
+lifecycle_options = { executable = "fake", sprint_root = "/tmp/lifecycle-two", server_url = "http://127.0.0.1" }
+loop.setup(lifecycle_options)
+wait_for(function()
+  local active = loop._test_state().status_active
+  return lifecycle_status_kills >= 1 and active and active.owner.kind == "setup" and active.argv[4] == "/tmp/lifecycle-two"
+end, "repeated setup cancels then serializes replacement status")
+wait_for(function()
+  local active = loop._test_state().status_active
+  return loop._test_state().watching and active and active.owner.kind == "watcher"
+end, "setup observation transitions to retained watcher status")
+
+local spawns_before_public_queries = lifecycle_status_spawns
+loop.progress()
+loop.open_session()
+vim.wait(20)
+check(lifecycle_active == 1 and lifecycle_status_spawns == spawns_before_public_queries, "progress and session status queries queue behind the global status child")
+
+local kills_before = lifecycle_status_kills
+loop._test_replace_watcher("/tmp/lifecycle-two")
+wait_for(function()
+  local active = loop._test_state().status_active
+  return lifecycle_status_kills > kills_before and active and active.owner.kind == "watcher"
+end, "watcher replacement cancels then serializes its status child")
+
+kills_before = lifecycle_status_kills
+loop.start()
+wait_for(function() return lifecycle_controller_spawns >= 1 and lifecycle_status_kills > kills_before end, "start replaces watcher status observation")
+wait_for(function()
+  local active = loop._test_state().status_active
+  return active and active.owner.kind == "watcher"
+end, "start watcher status waits for cancelled child callback")
+
+kills_before = lifecycle_status_kills
+loop.resume()
+wait_for(function() return lifecycle_controller_spawns >= 2 and lifecycle_status_kills > kills_before end, "resume replaces watcher status observation")
+wait_for(function()
+  local active = loop._test_state().status_active
+  return active and active.owner.kind == "watcher"
+end, "resume watcher status remains globally serialized")
+
+kills_before = lifecycle_status_kills
+loop.stop()
+wait_for(function() return lifecycle_controller_spawns >= 3 and lifecycle_status_kills > kills_before and loop._test_state().status_active == nil end, "stop cancels plugin-owned status observation")
+
+loop._test_replace_watcher("/tmp/lifecycle-two")
+wait_for(function() return loop._test_state().status_active ~= nil end, "exit test owns one status child")
+kills_before = lifecycle_status_kills
+local spawns_before_exit = lifecycle_status_spawns
+vim.api.nvim_exec_autocmds("VimLeavePre", {})
+wait_for(function() return lifecycle_status_kills > kills_before and loop._test_state().status_active == nil end, "VimLeavePre cancels retained status child")
+vim.wait(100)
+check(lifecycle_status_spawns == spawns_before_exit, "VimLeavePre cannot spawn a replacement status child")
+check(lifecycle_max == 1, "all setup, watcher, and public status children are globally non-overlapping")
+check(lifecycle_controller_kills == 0, "status cancellation never signals detached or control controller children")
 loop._test_reset()
 
 -- A delayed callback from a replaced setup generation cannot notify current state.

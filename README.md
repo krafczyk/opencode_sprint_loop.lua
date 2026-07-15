@@ -33,6 +33,8 @@ All six commands are registered when the plugin loads, so invoking one before
 successful setup reports `setup_required` instead of an unknown command. A
 later `setup()` replaces the active configuration and watcher, but pending
 question IDs remain deduplicated for the lifetime of that Neovim process.
+Unknown setup fields report only the fixed `invalid_setup` category; the
+untrusted field name is never copied into a notification.
 
 The generic plugin has no mkchad dependency or hard-coded mkchad API. A mkchad
 adapter may read an existing URL through a user-supplied callback such as
@@ -116,7 +118,11 @@ Setup first performs one asynchronous status observation, notifies for a valid
 pending request in that first document, and only then starts the single
 ephemeral watcher when the document reports a running controller.
 Successful start/resume launches also begin discovery. The watcher polls at a
-bounded two-second interval with at most one status process in flight. It stops
+bounded two-second interval. All plugin status queries share one serialized
+child-process slot. Repeated setup, watcher replacement, start/resume
+observation replacement, stop, and Neovim exit cancel plugin-owned read-only
+status children and wait for their completion callback before another status
+child starts; detached controller processes are never cancellation targets. It stops
 after an observed controller exits (including a final launch-completion observation)
 and emits one notification per pending request ID
 for future-compatible `waiting_for_user` status. It never reads question text,

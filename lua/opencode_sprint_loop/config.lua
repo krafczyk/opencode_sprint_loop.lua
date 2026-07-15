@@ -21,7 +21,9 @@ function M.validate(options)
   end
   for key in pairs(options) do
     if not allowed[key] then
-      return nil, "invalid_setup: unknown option " .. tostring(key)
+      -- Option names are untrusted and may themselves contain credentials,
+      -- terminal controls, or unbounded content. Keep this diagnostic fixed.
+      return nil, "invalid_setup"
     end
   end
   for _, key in ipairs(required) do

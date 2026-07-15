@@ -32,6 +32,8 @@ setup, watcher replacement, and Neovim exit cancel the relevant timers.
 Commands are registered at plugin load. Before successful setup they report
 `setup_required`; repeated setup replaces configuration and watcher state while
 preserving pending-request notification deduplication for this Neovim process.
+An unknown setup field reports fixed `invalid_setup` without displaying its
+untrusted name.
 
 COMMANDS                                                        *SprintLoop-commands*
 
@@ -66,6 +68,11 @@ question content or submit an answer. Sprint 2's probe is non-interactive;
 waiting is a controlled-fixture compatibility demonstration until Sprint 4.
 The watcher performs a final status observation when a launched controller
 exits before active state is observed and closes its timer when observation ends.
+All plugin status requests use one serialized child slot. Setup/watcher
+replacement, start/resume observation replacement, stop, and |VimLeavePre|
+cancel only plugin-owned read-only status children and wait for their callback
+before another status child starts. Detached controller children are not
+retained by this cancellation path and are never signalled by it.
 
 PROGRESS                                                        *SprintLoop-progress*
 

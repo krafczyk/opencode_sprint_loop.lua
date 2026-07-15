@@ -15,49 +15,100 @@ local workflow_states = {
 }
 local terminal_states = { stopped = true, failed = true, finished = true }
 
+local function previous_is(value, position, character_class)
+  if position <= 1 then return false end
+  return value:sub(position - 1, position - 1):match(character_class) ~= nil
+end
+
+local function find_plain(value, needle, start)
+  return value:find(needle, start or 1, true)
+end
+
+local function provider_token(value, lower, prefix, minimum, suffix_class)
+  local start = 1
+  while true do
+    local first, last = find_plain(lower, prefix, start)
+    if not first then return false end
+    local suffix = value:sub(last + 1):match("^(" .. suffix_class .. "+)") or ""
+    if #suffix >= minimum then return true end
+    start = last + 1
+  end
+end
+
 local function contains_credential(value)
   local lower = value:lower()
-  if lower:find("authorization%s*:%s*basic%s+%S+")
-    or lower:find("authorization%s*:%s*bearer%s+%S+")
-    or lower:find("proxy%-authorization%s*:%s*basic%s+%S+")
-    or lower:find("proxy%-authorization%s*:%s*bearer%s+%S+")
-    or value:find("-----BEGIN [A-Z ]*PRIVATE KEY-----") then return true end
+  for _, name in ipairs({ "authorization", "proxy-authorization" }) do
+    for _, scheme in ipairs({ "basic", "bearer" }) do
+      local start = 1
+      while true do
+        local first, last = lower:find(name .. "%s*:%s*" .. scheme .. "%s+%S+", start)
+        if not first then break end
+        -- Python's \b rejects a preceding ASCII word character.
+        if not previous_is(lower, first, "[A-Za-z0-9_]") then return true end
+        start = last + 1
+      end
+    end
+  end
 
-  for uri in value:gmatch("[%a][%w+%.%-]*://%S+") do
-    local authority = uri:match("^[%a][%w+%.%-]*://([^/%?#]*)")
-    if (authority and authority:find("@", 1, true)) or uri:find("?", 1, true) or uri:find("#", 1, true) then return true end
+  -- Match the controller's URI recognizers: a scheme starts at the first valid
+  -- scheme character, then user-info or non-empty query/fragment data rejects.
+  local uri_start = 1
+  while true do
+    local first, scheme, after = lower:match("()([a-z][a-z0-9+%.%-]*)://()", uri_start)
+    if not first then break end
+    if not previous_is(lower, first, "[A-Za-z0-9+%.%-]") then
+      local remainder = value:sub(after)
+      if remainder:match("^[^/%s@]*@") then return true end
+      local token = remainder:match("^([^%s]+)") or ""
+      local marker = token:find("[?#]")
+      if marker and marker > 1 then
+        local kind = token:sub(marker, marker)
+        local following = token:sub(marker + 1, marker + 1)
+        if (kind == "?" and following ~= "" and following ~= "#") or (kind == "#" and following ~= "") then return true end
+      end
+    end
+    uri_start = after
   end
 
   local names = {
-    "access_token", "access-token", "api_key", "api-key", "apikey", "authorization",
+    "access_token", "access-token", "accesstoken", "api_key", "api-key", "apikey", "authorization",
     "credential", "password", "secret", "token",
   }
   for _, name in ipairs(names) do
-    if lower:find("[?&#]" .. name .. "=[^&#%s]+")
-      or lower:find("%f[%w]" .. name .. "%f[^%w_-]%s*[=:]%s*%S+") then return true end
-  end
-
-  local provider_prefixes = {
-    { "ghs_", 36 }, { "gho_", 36 }, { "ghp_", 36 }, { "ghu_", 36 }, { "ghr_", 36 },
-    { "github_pat_", 20 }, { "glpat-", 20 }, { "glcbt-", 20 }, { "glptt-", 20 },
-    { "glrt-", 20 }, { "glimt-", 20 }, { "glsoat-", 20 }, { "gldt-", 20 },
-    { "glrtr-", 20 }, { "glft-", 20 }, { "glagent-", 20 }, { "glwt-", 20 },
-    { "glffct-", 20 }, { "gloas-", 20 }, { "sk-", 20 }, { "hf_", 20 },
-    { "xoxb-", 20 }, { "xoxa-", 20 }, { "xoxp-", 20 }, { "xoxr-", 20 },
-    { "xoxs-", 20 }, { "xapp-", 20 }, { "xwfp-", 20 }, { "aiza", 30 },
-    { "akia", 16 }, { "asia", 16 },
-  }
-  for _, item in ipairs(provider_prefixes) do
+    if lower:find("[?&#]" .. name .. "=[^&#%s]+") then return true end
     local start = 1
     while true do
-      local first, last = lower:find(item[1], start, true)
+      local first, last = find_plain(lower, name, start)
       if not first then break end
-      local suffix = value:sub(last + 1):match("^([A-Za-z0-9._-]+)") or ""
-      if #suffix >= item[2] then return true end
+      if not previous_is(lower, first, "[A-Za-z0-9_%-]") and lower:sub(last + 1):match("^%s*[=:]%s*%S+") then return true end
       start = last + 1
     end
   end
-  return false
+
+  local provider_patterns = {
+    { "ghs_", 36, "[A-Za-z0-9._%-]" },
+    { "gho_", 36, "[A-Za-z0-9]" }, { "ghp_", 36, "[A-Za-z0-9]" },
+    { "ghu_", 36, "[A-Za-z0-9]" }, { "ghr_", 36, "[A-Za-z0-9]" },
+    { "github_pat_", 20, "[A-Za-z0-9_]" },
+    { "glpat-", 20, "[A-Za-z0-9_%-]" }, { "glcbt-", 20, "[A-Za-z0-9_%-]" },
+    { "glptt-", 20, "[A-Za-z0-9_%-]" }, { "glrt-", 20, "[A-Za-z0-9_%-]" },
+    { "glimt-", 20, "[A-Za-z0-9_%-]" }, { "glsoat-", 20, "[A-Za-z0-9_%-]" },
+    { "gldt-", 20, "[A-Za-z0-9_%-]" }, { "glrtr-", 20, "[A-Za-z0-9_%-]" },
+    { "glft-", 20, "[A-Za-z0-9_%-]" }, { "glagent-", 20, "[A-Za-z0-9_%-]" },
+    { "glwt-", 20, "[A-Za-z0-9_%-]" }, { "glffct-", 20, "[A-Za-z0-9_%-]" },
+    { "gloas-", 20, "[A-Za-z0-9_%-]" },
+    { "sk-", 20, "[A-Za-z0-9_%-]" }, { "aiza", 30, "[A-Za-z0-9_%-]" },
+    { "hf_", 20, "[A-Za-z0-9]" },
+    { "xoxb-", 20, "[A-Za-z0-9%-]" }, { "xoxa-", 20, "[A-Za-z0-9%-]" },
+    { "xoxp-", 20, "[A-Za-z0-9%-]" }, { "xoxr-", 20, "[A-Za-z0-9%-]" },
+    { "xoxs-", 20, "[A-Za-z0-9%-]" }, { "xapp-", 20, "[A-Za-z0-9%-]" },
+    { "xwfp-", 20, "[A-Za-z0-9%-]" },
+    { "akia", 16, "[A-Za-z0-9]" }, { "asia", 16, "[A-Za-z0-9]" },
+  }
+  for _, item in ipairs(provider_patterns) do
+    if provider_token(value, lower, item[1], item[2], item[3]) then return true end
+  end
+  return lower:find("-----begin [a-z ]*private key-----") ~= nil
 end
 
 local function bounded_string(value)
