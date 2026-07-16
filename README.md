@@ -235,7 +235,8 @@ started supported OpenCode server rooted there. Do not point any variable below
 at `~/.config/mkchad`, and do not reuse its server, CA, credentials, or XDG
 directories. Install the controller in a disposable virtual environment, put
 this plugin checkout on the runtime path, create a uniquely named temporary root
-with `export SPRINT_LOOP_DEMO_TEMP="$(mktemp -d /tmp/opencode-sprint-loop-demo.XXXXXX)"`,
+with `mkdir -p /tmp/opencode-mkchad` followed by
+`export SPRINT_LOOP_DEMO_TEMP="$(mktemp -d /tmp/opencode-mkchad/sprint-loop-demo.XXXXXX)"`,
 and write the following init file to
 `$SPRINT_LOOP_DEMO_TEMP/init.lua`:
 
