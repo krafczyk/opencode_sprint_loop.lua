@@ -6,6 +6,26 @@ This repository contains the Lua Neovim client for the Sprint Loop Controller. I
 
 The plugin is intentionally thin. The Python controller remains authoritative for all sprint workflow behavior.
 
+## Parent Sprint Coordination
+
+This nested repository does not select development sprints. When used in the
+MkChad development workspace, selection belongs to
+`/data0/matthew/Projects/mkchad/AGENTS.md`; the immediate controller parent also
+provides repository-local guidance in `../AGENTS.md`.
+
+This plugin currently participates in `controller-v1/3` only when the resolved
+sprint scope includes plugin work. Its parent-owned documents are:
+
+- `../../docs/sprints/controller-v1/sprint_plan.md`
+- `../../docs/sprints/controller-v1/3/sprint_spec.md`
+- `../../docs/sprints/controller-v1/3/sprint_checklist.md`
+
+Do not infer another sprint from local files or unchecked rows. If sprint work
+arrives without an explicit parent-resolved selector, return to the MkChad
+coordination root or ask the user. Commit plugin changes before the controller
+repository records this submodule's updated gitlink, and commit the controller
+before the MkChad parent records its gitlink.
+
 ## Architecture Boundary
 
 The plugin may:
